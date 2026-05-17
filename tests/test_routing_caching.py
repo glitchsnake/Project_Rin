@@ -9,7 +9,7 @@ class TestRoutingCaching(unittest.TestCase):
     @patch('semantic_cache._init_cache_collection')
     @patch('memory._embed')
     def test_semantic_cache_hit(self, mock_embed, mock_init_coll):
-        """Verify semantic cache hit returns cached response."""
+        """Verify semantic cache hit returns cached response with composite filtering."""
         mock_coll = MagicMock()
         mock_init_coll.return_value = mock_coll
         mock_embed.return_value = [0.1, 0.2, 0.3]
@@ -22,7 +22,7 @@ class TestRoutingCaching(unittest.TestCase):
             "distances": [[0.04]]
         }
         
-        res = semantic_cache.get_semantic_cache("Как дела?")
+        res = semantic_cache.get_semantic_cache("Как дела?", "нейтральное", "neutral")
         self.assertEqual(res, "Все отлично, спасибо!")
         mock_coll.query.assert_called_once()
 
@@ -42,7 +42,7 @@ class TestRoutingCaching(unittest.TestCase):
             "distances": [[0.12]]
         }
         
-        res = semantic_cache.get_semantic_cache("Как дела?")
+        res = semantic_cache.get_semantic_cache("Как дела?", "нейтральное", "neutral")
         self.assertIsNone(res)
 
     @patch('semantic_router_engine.init_router')

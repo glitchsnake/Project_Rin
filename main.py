@@ -257,7 +257,16 @@ async def _process_text(message: types.Message, user_text: str, label: str = "")
     chat_history = await get_session(chat_id) # [V10.2] await
 
     # ── [Семантический кэш] ──────────────────────────────
-    cached_response = await get_semantic_cache_async(user_text)
+    warmth = persona.get("warmth", 0.0)
+    attitude = persona.get("base_attitude", "нейтральное")
+    if warmth < 0:
+        warmth_tier = "cold"
+    elif warmth <= 0.5:
+        warmth_tier = "neutral"
+    else:
+        warmth_tier = "warm"
+
+    cached_response = await get_semantic_cache_async(user_text, attitude, warmth_tier)
     if cached_response:
         # Имитируем набор текста
         await bot.send_chat_action(chat_id=chat_id, action="typing")
@@ -410,7 +419,15 @@ async def _process_text(message: types.Message, user_text: str, label: str = "")
         )
         
         # Сохранение в семантический кэш
-        asyncio.create_task(save_semantic_cache_async(user_text, ai_response))
+        final_warmth = persona.get("warmth", 0.0)
+        final_attitude = persona.get("base_attitude", "нейтральное")
+        if final_warmth < 0:
+            final_warmth_tier = "cold"
+        elif final_warmth <= 0.5:
+            final_warmth_tier = "neutral"
+        else:
+            final_warmth_tier = "warm"
+        asyncio.create_task(save_semantic_cache_async(user_text, ai_response, final_attitude, final_warmth_tier))
 
         # ── [V10] Авто-саммаризация (Триггер теперь внутри памяти) ────
         asyncio.create_task(_run_summarization(chat_id, session_id))
