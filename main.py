@@ -475,6 +475,11 @@ if DISCORD_AVAILABLE:
     @bot.event
     async def on_ready():
         logger.info(f"🌸 Бот {bot.user.name} успешно подключился к Discord!")
+        try:
+            await bot.change_presence(status=discord.Status.dnd)
+            logger.info("🌙 Статус бота изменен на 'Не беспокоить' (DND)")
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось установить статус DND: {e}")
 
     # ── Команды ───────────────────────────────────────────
     @bot.command(name="start")
