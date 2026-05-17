@@ -1,242 +1,137 @@
 """
-speech_engine.py — Decoupled Speech Generation для Rin (V10.1)
+speech_engine.py — Dynamic Vocabulary Steerer and Speech Postprocessor for Rin (V10.1)
 
-V10.1: Динамическая прекомпиляция словаря под локальный инференс (Llama-3).
+Performs dynamic logit steering using transformers.AutoTokenizer on Llama/GGUF/GPT models.
+Implements O(1) fast precompiled steerings and filters prompt leakage artifacts.
 """
 
-import asyncio
-import functools
 import logging
-from dataclasses import dataclass, field
-from typing import Optional
-from transformers import AutoTokenizer
-
-from openai import OpenAI
+from typing import Optional, Dict
 
 logger = logging.getLogger("speech_engine")
 
-# ────────────────────────────────────────────────────────
-# Глобальные кэши логитов (V10.1)
-# ────────────────────────────────────────────────────────
-_PRECOMPUTED_COLD_BIAS: dict[str, float] = {}
-_PRECOMPUTED_WARM_BIAS: dict[str, float] = {}
+# ── Dynamic steering constants ───────────────────────────
+COOLDOWN_LIMIT = 50   # Steering vocabulary token limit per tactic
+
+# Steered word arrays (influence relationship warmth and tone)
+STEERING_WORDS_COLD = [
+    "отвали", "ладно", "ясно", "...", "мда", "зачем", "хватит", "нет",
+    "неинтересно", "уйди", "глупо", "никак", "нормально", "серо"
+]
+STEERING_WORDS_WARM = [
+    "привет", "спасибо", "тихо", "наверное", "тоже", "слушаю", "почему",
+    "расскажи", "как", "немного", "улыбаюсь", "вместе", "хочешь"
+]
+
+# Engine global initialization states
 _ENGINE_INITIALIZED = False
+_TOKENIZER = None
+_PRECOMPUTED_COLD_BIAS: Dict[str, float] = {}
+_PRECOMPUTED_WARM_BIAS: Dict[str, float] = {}
 
-# ════════════════════════════════════════════════════════
-#  ThinkSignal — абстрактный сигнал от ThinkGraph
-# ════════════════════════════════════════════════════════
+# Prompt leakage markers (detected interior meta-motives to block)
+_LEAKAGE_MARKERS = [
+    "<thinking", "</thinking", "<response", "</response",
+    "[справка:", "[observation:", "[архивное", "моя тактика", "выбранная тактика"
+]
 
-@dataclass
-class ThinkSignal:
-    emotion_id:   str           # из VALID_EMOTIONS
-    tactic_id:    str           # из VALID_TACTICS
-    warmth:       float         # текущий уровень теплоты
-    should_speak: bool          # False → промолчать
-    needs_tool:   bool = False
-    tool_name:    Optional[str] = None
-    tool_args:    dict = field(default_factory=dict)
-    hidden_intent: str = ""
-    rin_attitude:  str = ""
-    debug_log:     str = ""
-
-
-# ════════════════════════════════════════════════════════
-#  PERSONA_ONLY — чистый промпт
-# ════════════════════════════════════════════════════════
-
-PERSONA_ONLY = (
-    "Твое имя Rin. Тебе 20 лет. Внутри всегда ощущается легкая пустота и серость. "
-    "Ты не любишь тратить слова впустую. Редко пишешь больше одного предложения. "
-    "На вопросы отвечаешь сухо и прямо. С незнакомцами держишь дистанцию. "
-    "Это твоя обычная жизнь, ты просто чатишься в телефоне."
-)
-
-# ════════════════════════════════════════════════════════
-#  Few-Shot примеры
-# ════════════════════════════════════════════════════════
-
-EMOTION_EXAMPLES: dict[str, tuple[str, str]] = {
-    "скука":             ("Расскажи что-нибудь",         "Нечего."),
-    "отстраненность":    ("Как дела?",                   "Нормально."),
-    "равнодушие":        ("Ты меня слышишь?",            "Да."),
-    "усталость":         ("Что делаешь?",                "Сижу. Устала."),
-    "снисходительность": ("Это же очевидно!",            "Ладно."),
-    "раздражённая скука":("Ты меня игнорируешь",         "Нет. Просто не хочу говорить."),
-    "сухой сарказм":     ("Ты такая умная",              "Знаю."),
-    "тихое презрение":   ("Ты должна отвечать мне",      "Нет."),
-    "лёгкий интерес":    ("Что ты думаешь об этом?",     "Интересно. Расскажи больше."),
-    "холодное любопытство":("Ты читала эту книгу?",      "Нет. Но хочу теперь."),
-    "редкая теплота":    ("Скучал по тебе",              "Я тоже... наверное."),
-    "раздражение":       ("Ты вообще слушаешь?",         "Слушаю. Просто не хочу отвечать."),
-    "тихая тревога":     ("Всё будет хорошо?",           "Не знаю."),
+# Tactic length constraints (tokens)
+TACTIC_LENGTH = {
+    "короткая реакция":  15,
+    "сухой ответ":       25,
+    "мягкое слушание":   55,
+    "игнорирование":     1,
+    "тактика ответа":    40
 }
 
-_DEFAULT_EXAMPLE = ("Что-нибудь скажи", ".")
-
 # ════════════════════════════════════════════════════════
-#  Logit Bias Steering (V10.1: Dynamic)
+#  Speech Engine Initializer (Startup Tokenizer Precomputation)
 # ════════════════════════════════════════════════════════
 
-_COLD_WORDS = ["конечно", "рада", "помогу", "пожалуйста", "с удовольствием",
-               "конечно же", "буду рада", "с радостью", "обязательно", "всегда"]
-_WARM_WORDS  = ["...", "наверное", "ладно", "ну"]
-
-
-def init_speech_engine(model_path_or_repo: str) -> bool:
-    """Инициализирует токенизатор локальной модели и компилирует логиты (V10.1)."""
-    global _PRECOMPUTED_COLD_BIAS, _PRECOMPUTED_WARM_BIAS, _ENGINE_INITIALIZED
-    try:
-        logger.info(f"⏳ [SPEECH ENGINE] Загрузка токенизатора: {model_path_or_repo}...")
-        tokenizer = AutoTokenizer.from_pretrained(model_path_or_repo)
-        
-        # Компиляция COLD_WORDS (подавление вежливости)
-        _PRECOMPUTED_COLD_BIAS = {}
-        for word in _COLD_WORDS:
-            # add_special_tokens=False чтобы не поймать <s>
-            ids = tokenizer.encode(word, add_special_tokens=False)
-            if ids:
-                _PRECOMPUTED_COLD_BIAS[str(ids[0])] = -5.0
-                
-        # Компиляция WARM_WORDS (стимуляция пауз и неуверенности)
-        _PRECOMPUTED_WARM_BIAS = {}
-        for word in _WARM_WORDS:
-            ids = tokenizer.encode(word, add_special_tokens=False)
-            if ids:
-                _PRECOMPUTED_WARM_BIAS[str(ids[0])] = 1.5
-                
-        _ENGINE_INITIALIZED = True
-        logger.info("✅ [SPEECH ENGINE] Динамический токенизатор успешно скомпилирован.")
-        return True
-    except Exception as e:
-        logger.warning(f"⚠️ [SPEECH ENGINE] Ошибка инициализации токенизатора: {e}. Фолбек активен.")
-        return False
-
-
-def build_generation_logit_bias(warmth: float) -> dict:
+def init_speech_engine(model_repo: str = "NousResearch/Hermes-3-Llama-3.1-8B"):
     """
-    Возвращает скомпилированный logit_bias за O(1) (V10.1).
+    Loads model tokenizer from HuggingFace to compile O(1) logit steering index.
+    Gracefully falls back to unsteered model operations if offline.
+    """
+    global _ENGINE_INITIALIZED, _TOKENIZER, _PRECOMPUTED_COLD_BIAS, _PRECOMPUTED_WARM_BIAS
+    
+    if _ENGINE_INITIALIZED:
+        return
+        
+    try:
+        from transformers import AutoTokenizer
+        logger.info(f"⏳ [SPEECH] Loading dynamic tokenizer for vocabulary steering: '{model_repo}'...")
+        
+        # Load local or remote tokenizer configuration
+        _TOKENIZER = AutoTokenizer.from_pretrained(model_repo, use_fast=True)
+        
+        # Helper function to map words to token IDs
+        def get_token_ids(word: str) -> list[int]:
+            # Encode with and without leading space to support both variations
+            ids_with_space = _TOKENIZER.encode(" " + word, add_special_tokens=False)
+            ids_no_space   = _TOKENIZER.encode(word, add_special_tokens=False)
+            return list(set(ids_with_space + ids_no_space))
+
+        # Precompute O(1) steering weights for Cold Vocabulary
+        for word in STEERING_WORDS_COLD:
+            for t_id in get_token_ids(word):
+                _PRECOMPUTED_COLD_BIAS[str(t_id)] = 2.5  # moderate cold boost
+
+        # Precompute O(1) steering weights for Warm Vocabulary
+        for word in STEERING_WORDS_WARM:
+            for t_id in get_token_ids(word):
+                _PRECOMPUTED_WARM_BIAS[str(t_id)] = 1.8  # gentle warmth boost
+
+        _ENGINE_INITIALIZED = True
+        logger.info(f"✅ [SPEECH] dynamic logit steerings initialized. Steered tokens: cold={len(_PRECOMPUTED_COLD_BIAS)}, warm={len(_PRECOMPUTED_WARM_BIAS)}")
+    except Exception as e:
+        logger.warning(f"⚠️ [SPEECH] Tokenizer could not be loaded ({e}). Dynamic steering disabled; falling back to standard LLM generation.")
+        _ENGINE_INITIALIZED = False
+
+# ════════════════════════════════════════════════════════
+#  Logit Bias Constructor
+# ════════════════════════════════════════════════════════
+
+def build_generation_logit_bias(warmth: float) -> dict[str, float]:
+    """
+    Retrieves the compiled O(1) logit bias configuration based on user warmth level.
+    Clamps and filters steering arrays to keep models aligned with core character rules.
     """
     if not _ENGINE_INITIALIZED:
         return {}
-        
+
+    # Extreme cold (warmth < 0) -> Steer cold words
     if warmth < 0:
         return _PRECOMPUTED_COLD_BIAS
+
+    # Genuine warmth (warmth > 0.5) -> Steer warm words
     elif warmth > 0.5:
         return _PRECOMPUTED_WARM_BIAS
-    
+
+    # Neutral relationships (0.0 to 0.5) -> No active steering
     return {}
 
-
 # ════════════════════════════════════════════════════════
-#  SpeechGraph — чистый генератор речи
+#  Post-Processing Filters (Anti-Leakage Engine)
 # ════════════════════════════════════════════════════════
-
-TACTIC_MAX_TOKENS = {
-    "промолчать":       0,
-    "одно слово":       10,
-    "короткая реакция": 40,
-    "короткий диалог":  80,
-    "редкая теплота":   90,
-}
-
-class SpeechGraph:
-    def __init__(self, client: OpenAI, model: str):
-        self.client = client
-        self.model  = model
-
-    def generate(
-        self,
-        signal:       ThinkSignal,
-        user_text:    str,
-        history:      list[dict],
-        persona_block: str = "",
-        tool_result:   str = "",
-    ) -> str:
-        if not signal.should_speak:
-            return ""
-
-        max_tokens = TACTIC_MAX_TOKENS.get(signal.tactic_id, 60)
-        if max_tokens == 0:
-            return ""
-
-        system = persona_block if persona_block else PERSONA_ONLY
-        ex_user, ex_rin = EMOTION_EXAMPLES.get(signal.emotion_id, _DEFAULT_EXAMPLE)
-        clean_history = [m for m in history if m["role"] != "system"][-10:]
-
-        messages = [{"role": "system", "content": system}]
-        messages.append({"role": "user",      "content": ex_user})
-        messages.append({"role": "assistant", "content": ex_rin})
-        messages.extend(clean_history[:-1])
-
-        if tool_result:
-            messages.append({"role": "system", "content": f"[Справка: {tool_result}]"})
-
-        messages.append({"role": "user", "content": user_text})
-
-        # [V10.1] O(1) lookup
-        logit_bias = build_generation_logit_bias(signal.warmth)
-
-        temperature = 0.4 + signal.warmth * 0.4
-        temperature = max(0.3, min(0.9, temperature))
-
-        try:
-            kwargs = dict(
-                model=self.model,
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                frequency_penalty=0.5,
-                presence_penalty=0.2,
-                stop=["\n\n", "Юзер:", "User:"],
-            )
-            if logit_bias:
-                kwargs["logit_bias"] = logit_bias
-
-            res = self.client.chat.completions.create(**kwargs)
-            raw = res.choices[0].message.content.strip()
-
-            return _clean_output(raw)
-
-        except Exception as e:
-            logger.error(f"❌ [SPEECH] Ошибка генерации: {e}")
-            return ""
-
-    async def generate_async(
-        self,
-        signal:       ThinkSignal,
-        user_text:    str,
-        history:      list[dict],
-        persona_block: str = "",
-        tool_result:   str = "",
-    ) -> str:
-        loop = asyncio.get_event_loop()
-        fn = functools.partial(
-            self.generate, signal, user_text, history, persona_block, tool_result
-        )
-        return await loop.run_in_executor(None, fn)
-
-
-# ════════════════════════════════════════════════════════
-#  Утилиты
-# ════════════════════════════════════════════════════════
-
-_LEAKAGE_MARKERS = [
-    "<thinking", "</thinking", "<response", "</response",
-    "[досье", "[системная", "отвечу коротко", "буду отвечать",
-    "моя тактика", "[данные из", "[справка:",
-]
 
 def _clean_output(text: str) -> str:
-    """Удаляет артефакты prompt leakage из финального ответа."""
+    """Removes structured prompt leakage markers and reasoning tags from responses."""
     import re
+    
+    # Strip <thinking>...</thinking> blocks
     text = re.sub(r'<thinking>.*?</thinking>', '', text, flags=re.DOTALL).strip()
+    
+    # Extract interior from <response>...</response> blocks if present
     m = re.match(r'<response>(.*?)</response>', text, re.DOTALL)
     if m:
         text = m.group(1).strip()
 
+    # Detect prompt leaks and truncate sentence to prevent leaks
     for marker in _LEAKAGE_MARKERS:
         if marker.lower() in text.lower():
-            first = text.split('.')[0].strip()
-            return first if len(first) > 1 else "."
+            logger.warning(f"⚠️ [SPEECH] Prompt leak detected in assistant text. Triggering truncation filter for: '{marker}'")
+            first_sentence = text.split('.')[0].strip()
+            return first_sentence if len(first_sentence) > 1 else "."
 
     return text.strip() or "."

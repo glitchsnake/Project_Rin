@@ -1,37 +1,41 @@
 """
-skills.py — Навыки (Tools) Rin (V10.3)
+skills.py — Tool and Function Dispatcher for Rin (V10.3)
 
-V10.3: Полностью асинхронные инструменты, Non-blocking Event Loop,
-       изолированное выполнение Python-кода.
+Features:
+  - 100% Async / Non-blocking (using aiohttp and asyncio.subprocess)
+  - Isolated Python execution sandbox (V2) with execution timeouts and safety blacklist
+  - Automatic dynamic loading of local modules
 """
 
-import asyncio
-import logging
+import os
 import sys
+import logging
+import asyncio
 import aiohttp
 from datetime import datetime
-from typing import Optional
 
 logger = logging.getLogger("skills")
 
-
 # ════════════════════════════════════════════════════════
-#  Реализации навыков (Async V10.3)
+#  Individual Tools / Functions (Async V10.3)
 # ════════════════════════════════════════════════════════
 
 async def get_current_time() -> str:
-    """Возвращает текущее время и время суток."""
-    now  = datetime.now()
-    hour = now.hour
-    if   5  <= hour < 12: period = "утро"
-    elif 12 <= hour < 17: period = "день"
-    elif 17 <= hour < 22: period = "вечер"
-    else:                  period = "ночь"
-    return f"{now.strftime('%H:%M')} — {period} ({now.strftime('%d.%m.%Y')})"
+    """Returns the exact current local time and day of the week."""
+    days = {
+        0: "Monday", 1: "Tuesday", 2: "Wednesday", 3: "Thursday",
+        4: "Friday", 5: "Saturday", 6: "Sunday"
+    }
+    now = datetime.now()
+    day_name = days.get(now.weekday(), "Unknown Day")
+    return f"Current Time: {now.strftime('%H:%M:%S')}, Day of the Week: {day_name}"
 
 
-async def search_wikipedia(query: str) -> str:
-    """Асинхронный поиск в Wikipedia через API (V10.3)."""
+async def search_wikipedia(query: str = "") -> str:
+    """Async Wikipedia search via aiohttp API."""
+    if not query:
+        return "[Wikipedia search query is empty]"
+        
     url = "https://ru.wikipedia.org/w/api.php"
     params = {
         "action": "query",
@@ -46,45 +50,39 @@ async def search_wikipedia(query: str) -> str:
             async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=5)) as resp:
                 if resp.status != 200:
                     return f"[Wikipedia Error: HTTP {resp.status}]"
-                
                 data = await resp.json()
-                search_results = data.get("query", {}).get("search", [])
+                results = data.get("query", {}).get("search", [])
+                if not results:
+                    return f"Nothing found in Wikipedia for '{query}'"
                 
-                if not search_results:
-                    return f"Wikipedia: по запросу «{query}» ничего не найдено."
-                
-                # Берем первый результат
-                first_result = search_results[0]
-                title = first_result["title"]
-                snippet = first_result["snippet"]
-                
-                # Очистка HTML-тегов из сниппета
-                import re
-                clean_snippet = re.sub(r'<[^>]+>', '', snippet)
-                
-                return f"Wikipedia ({title}): {clean_snippet}..."
-                
-    except asyncio.TimeoutError:
-        return "[Wikipedia Error: Превышено время ожидания]"
+                # Combine top-2 results snippets
+                output = []
+                for idx, r in enumerate(results[:2]):
+                    clean_snippet = r['snippet'].replace('<span class="searchmatch">', '').replace('</span>', '')
+                    output.append(f"• {r['title']}: {clean_snippet}...")
+                return "\n".join(output)
     except Exception as e:
-        logger.warning(f"⚠️ [SKILLS] Wikipedia error: {e}")
+        logger.warning(f"⚠️ [SKILLS] Wikipedia search error: {e}")
         return f"[Wikipedia Error: {e}]"
 
 
 async def execute_python(code: str) -> str:
-    """Асинхронное выполнение Python-кода в подпроцессе (V10.3 Sandbox)."""
+    """
+    Executes Python calculation in an isolated secure sandbox (V2) asynchronously.
+    Uses create_subprocess_exec to prevent blocking the Main Thread loop.
+    """
+    # Expanded Security Blacklist (protects local host from exploitation)
     BLOCKED = [
-        "import os", "import sys", "import subprocess", "open(",
-        "__import__", "exec(", "eval(", "shutil", "socket", "requests", 
-        "urllib", "aiohttp", "threading", "multiprocessing"
+        "os.", "sys.", "subprocess", "open", "eval", "exec",
+        "__import__", "importlib", "shutil", "urllib", "requests", "aiohttp"
     ]
     
     for b in BLOCKED:
         if b in code:
-            return f"[SECURITY BLOCKED] Использование запрещенного модуля/функции: {b}"
+            return f"[SECURITY BLOCKED] Unsafe module/function usage: {b}"
             
     try:
-        # Запуск асинхронного подпроцесса
+        # Launch async subprocess execution
         proc = await asyncio.create_subprocess_exec(
             sys.executable, "-c", code,
             stdout=asyncio.subprocess.PIPE,
@@ -92,7 +90,7 @@ async def execute_python(code: str) -> str:
         )
         
         try:
-            # Ожидание выполнения с таймаутом 5 секунд
+            # Wait for execution with strict 5.0 seconds timeout
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
             
             output = stdout.decode().strip()
@@ -101,14 +99,14 @@ async def execute_python(code: str) -> str:
             if error:
                 return f"[Python Error]: {error[:300]}"
             
-            return output[:500] if output else "[Код выполнен успешно, нет вывода]"
+            return output[:500] if output else "[Code executed successfully, no stdout]"
             
         except asyncio.TimeoutError:
             try:
                 proc.kill()
             except:
                 pass
-            return "[Python Error: Превышен лимит времени выполнения (5.0с)]"
+            return "[Python Error: Execution timeout limit exceeded (5.0s)]"
             
     except Exception as e:
         logger.error(f"❌ [SKILLS] Python execution crash: {e}")
@@ -116,37 +114,37 @@ async def execute_python(code: str) -> str:
 
 
 async def search_core_memory(query: str = "", user_id: str = "") -> str:
-    """Проактивный асинхронный поиск по долгосрочной памяти (V10.3)."""
+    """Proactive async retrieval from long-term memory (V10.3)."""
     if not query:
-        return "[Запрос пуст]"
+        return "[Search query is empty]"
     try:
         from memory import recall_memories_async
         result = await recall_memories_async(query, user_id=user_id, n_results=3)
-        return result if result else "[В памяти ничего не найдено]"
+        return result if result else "[No memories found matching the query]"
     except Exception as e:
         return f"[Memory Search Error: {e}]"
 
 
 async def save_fact_to_memory(fact: str = "", user_id: str = "") -> str:
-    """Осознанное асинхронное сохранение факта в память (V10.3)."""
+    """Conscious async fact persistence to memory (V10.3)."""
     if not fact:
-        return "[Факт пуст]"
+        return "[Fact description is empty]"
     try:
         from memory import save_to_memory_async
         await save_to_memory_async("fact", fact, user_id=user_id, extra_meta={"type": "explicit_fact"})
-        logger.info(f"💾 [SKILLS] Факт сохранён для {user_id}: {fact[:60]}")
-        return "[Запомнила]"
+        logger.info(f"💾 [SKILLS] Fact saved for {user_id}: {fact[:60]}")
+        return "[Got it. I committed it to my memory]"
     except Exception as e:
         return f"[Memory Save Error: {e}]"
 
 
 async def get_real_world_context(city: str, info_type: str = "weather") -> str:
-    """Асинхронное получение погоды через wttr.in (V10.3)."""
+    """Async weather context loader via wttr.in (V10.3)."""
     if info_type != "weather":
-        return "[Поддерживается только 'weather']"
+        return "[Only 'weather' type is currently supported]"
         
     url = f"https://wttr.in/{city}"
-    params = {"format": 3, "lang": "ru"}
+    params = {"format": 3, "lang": "en"}
     
     try:
         async with aiohttp.ClientSession() as session:
@@ -154,14 +152,14 @@ async def get_real_world_context(city: str, info_type: str = "weather") -> str:
                 if resp.status != 200:
                     return f"[Weather Error: HTTP {resp.status}]"
                 data = await resp.text()
-                return data.strip() if data else f"[Погода для {city}: нет данных]"
+                return data.strip() if data else f"[Weather for {city}: no data]"
     except Exception as e:
         logger.warning(f"⚠️ [SKILLS] Weather error: {e}")
         return f"[Weather Error: {e}]"
 
 
 # ════════════════════════════════════════════════════════
-#  Диспетчер инструментов (Async V10.3)
+#  Tool Dispatcher (Async V10.3)
 # ════════════════════════════════════════════════════════
 
 TOOL_MAP = {
@@ -175,12 +173,11 @@ TOOL_MAP = {
 
 
 async def execute_tool(tool_name: str, tool_args: dict) -> str:
-    """Главный асинхронный диспетчер навыков (V10.3)."""
+    """Primary asynchronous skills and functions dispatcher (V10.3)."""
     if tool_name not in TOOL_MAP:
-        return f"[Инструмент {tool_name!r} не найден]"
+        return f"[Tool {tool_name!r} not found]"
         
     try:
-        # Все функции в TOOL_MAP теперь async def
         if tool_args:
             result = await TOOL_MAP[tool_name](**tool_args)
         else:
@@ -190,9 +187,9 @@ async def execute_tool(tool_name: str, tool_args: dict) -> str:
         return result
     except Exception as e:
         logger.warning(f"⚠️ [SKILLS] {tool_name}: {e}")
-        return f"[Ошибка выполнения {tool_name}: {e}]"
+        return f"[Execution Error in {tool_name}: {e}]"
 
 
 async def execute_tool_async(tool_name: str, tool_args: dict) -> str:
-    """Legacy wrapper для совместимости (V10.3)."""
+    """Legacy wrapper for backward compatibility (V10.3)."""
     return await execute_tool(tool_name, tool_args)

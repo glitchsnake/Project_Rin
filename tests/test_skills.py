@@ -37,12 +37,12 @@ class TestSkills(unittest.IsolatedAsyncioTestCase):
         mock_wait_for.side_effect = asyncio.TimeoutError()
         slow_code = "import time\nwhile True:\n    time.sleep(1)"
         res = await execute_python(slow_code)
-        self.assertIn("Превышен лимит времени выполнения", res)
+        self.assertIn("timeout", res.lower())
 
     async def test_execute_tool_async_unregistered(self):
         """Verify that requesting an unregistered tool returns an error."""
         res = await execute_tool_async("non_existent_tool", {"arg": 1})
-        self.assertIn("не найден", res)
+        self.assertIn("not found", res.lower())
 
     @patch('skills.aiohttp.ClientSession.get')
     async def test_search_wikipedia_mocked(self, mock_get):

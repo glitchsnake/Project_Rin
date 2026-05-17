@@ -1,108 +1,105 @@
 """
-think_engine.py — Модуль мышления Rin (V10: Structured Outputs + Pydantic + Native Tools)
+think_engine.py — Rin Cognitive Thinking Module (V10: Structured Outputs + Pydantic + Native Tools)
 
-Архитектурное вдохновение:
-  • OpenAI Structured Outputs → Нативный JSON через Pydantic.
-  • LangGraph (LC)             → Адаптивное ветвление: System 1 (Fast) vs System 2 (Deep).
+Architectural Inspiration:
+  • OpenAI Structured Outputs → Native JSON parsing via Pydantic.
+  • LangGraph (LC)             → Adaptive branching: System 1 (Fast) vs System 2 (Deep).
 """
 
 import asyncio
 import functools
-import json
-import re
-from dataclasses import dataclass, field
-from typing import Optional, Dict, Any, List
+import logging
+from dataclasses import dataclass
+from typing import Optional, List, Tuple
 from openai import OpenAI
 from pydantic import BaseModel, Field, field_validator
 
+logger = logging.getLogger("think_engine")
+
 # ════════════════════════════════════════════════════════
-#  Контракты данных
+#  Data Contracts
 # ════════════════════════════════════════════════════════
 
 @dataclass
 class ThinkSignal:
-    emotion_id:    str
-    tactic_id:     str
-    warmth:        float
-    should_speak:  bool
-    needs_tool:    bool = False
-    tool_name:     Optional[str] = None
-    tool_args:     dict = field(default_factory=dict)
-    hidden_intent: str = ""
-    rin_attitude:  str = ""
-    debug_log:     str = ""
+    emotion_id: str
+    tactic_id: str
+    warmth: float
+    should_speak: bool
+    needs_tool: bool
+    tool_name: Optional[str]
+    tool_args: Optional[dict]
+    hidden_intent: str
+    rin_attitude: str
+    debug_log: str
 
-@dataclass
+
 class ThinkState:
-    user_text: str
-    history_summary: str = ""
-    memories_summary: str = ""
-    current_user_name: str = "незнакомец"
-    user_role: str = "незнакомец"
-    base_attitude: str = "нейтральное"
-    time_passed_str: str = ""
-    current_time_str: str = ""
-    
-    # Результаты анализа
-    fact_analysis: str = ""
-    hidden_intent: str = ""
-    rin_inner_conflict: str = ""
-    confidence: float = 0.5
-    rin_emotion: str = "отстраненность"
-    rin_attitude: str = "нейтральное"
-    response_tactic: str = "короткая реакция"
-    
-    # Флаги
-    should_ignore: bool = False
-    needs_tool: bool = False
-    tool_name: Optional[str] = None
-    tool_args: dict = field(default_factory=dict)
-    error: Optional[str] = None
+    def __init__(self, user_text: str, **kwargs):
+        self.user_text: str = user_text
+        self.user_role: str = kwargs.get("user_role", "stranger")
+        self.current_user_name: str = kwargs.get("user_name", "User")
+        self.base_attitude: str = kwargs.get("base_attitude", "neutral")
+        self.warmth: float = kwargs.get("warmth", 0.0)
+        self.history_summary: str = kwargs.get("history_summary", "")
+        self.memories_summary: str = kwargs.get("memories_summary", "")
+        
+        # Time constraints
+        self.time_passed_str: str = ""
+        self.current_time_str: str = ""
+        
+        # Analysis results
+        self.fact_analysis: str = ""
+        self.hidden_intent: str = ""
+        self.rin_inner_conflict: str = ""
+        self.rin_emotion: str = "boredom"
+        self.rin_attitude: str = "neutral"
+        self.response_tactic: str = "short response"
+        
+        # Flags
+        self.should_ignore: bool = False
+        self.needs_tool: bool = False
+        self.tool_name: Optional[str] = None
+        self.tool_args: Optional[dict] = None
+        self.confidence: float = 1.0
+        self.error: Optional[str] = None
 
 # ════════════════════════════════════════════════════════
-#  Списки валидных значений
+#  Valid Parameter Lists (Enums aligned with fine-tune dataset)
 # ════════════════════════════════════════════════════════
 
 VALID_EMOTIONS = {
-    "отстраненность", "скука", "усталость", "равнодушие", "задумчивость",
-    "снисходительность", "раздражённая скука", "сухой сарказм", "тихое презрение", 
-    "язвительность", "мрачная ирония", "защитная агрессия",
-    "лёгкий интерес", "холодное любопытство", "мрачный юмор", "лёгкая издёвка", "ухмылка",
-    "тихая грусть", "меланхолия", "чувство одиночества", "ностальгия", "уязвимость", "тихая тревога",
-    "редкая теплота", "сдержанная радость", "смущение", "искренняя улыбка", 
-    "чувство безопасности", "тихая благодарность", "забота",
-    "раздражение", "гнев", "обида",
+    "задумчивость", "скука", "растерянность", "сухой сарказм",
+    "тихое презрение", "раздражение", "равнодушие", "отстраненность",
+    "усталая нежность", "грусть", "щемящая пустота", "тихое тепло"
 }
 
 VALID_ATTITUDES = {
-    "враждебное", "настороженное", "безразличное", "нейтральное", 
-    "заинтересованное", "слегка тёплое", "тёплое и доверительное", "привязанность", "раздражённое"
+    "отстраненное", "настороженное", "нейтральное", "заинтересованное",
+    "тёплое и доверительное"
 }
 
 VALID_TACTICS = {
-    "промолчать", "одно слово", "короткая реакция", "короткий диалог", 
-    "ироничный укол", "игривая издёвка", "уход в себя", "философское размышление", 
-    "редкая теплота", "забота и поддержка", "эмоциональный срыв"
+    "короткая реакция", "сухой ответ", "мягкое слушание", "игнорирование"
 }
 
 TACTIC_LENGTH = {
-    "промолчать":       0,
-    "одно слово":       1,
     "короткая реакция": 15,
-    "короткий диалог":  40,
-    "редкая теплота":   50,
+    "сухой ответ": 25,
+    "мягкое слушание": 55,
+    "игнорирование": 1
 }
 
 # ════════════════════════════════════════════════════════
-#  V10: Native Tool Definitions
+#  Native Tool Declarations (Function Schemas)
 # ════════════════════════════════════════════════════════
 
-RIN_TOOLS = [
+NATIVE_TOOLS = [
     {
         "type": "function",
         "function": {
             "name": "get_current_time",
-            "description": "Узнать точное текущее время и день недели.",
+            "description": "Get the exact current time and day of the week.",
             "parameters": {"type": "object", "properties": {}, "required": []}
         }
     },
@@ -110,11 +107,11 @@ RIN_TOOLS = [
         "type": "function",
         "function": {
             "name": "search_wikipedia",
-            "description": "Поиск фактов в Википедии (кто это, что это).",
+            "description": "Search Wikipedia for objective facts (who is, what is).",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "Поисковый запрос"}
+                    "query": {"type": "string", "description": "Search query"}
                 },
                 "required": ["query"]
             }
@@ -124,145 +121,220 @@ RIN_TOOLS = [
         "type": "function",
         "function": {
             "name": "execute_python",
-            "description": "Выполнить сложный расчет или запустить Python-код.",
+            "description": "Run a complex calculation or execute sandboxed Python code.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "code": {"type": "string", "description": "Код на Python"}
+                    "code": {"type": "string", "description": "Python code"}
                 },
                 "required": ["code"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_core_memory",
+            "description": "Query long-term memories for dynamic user profiles details.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Information topic query"}
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "save_fact_to_memory",
+            "description": "Save a verified factual preference or event to user's memory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "fact": {"type": "string", "description": "Fact statement"}
+                },
+                "required": ["fact"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_real_world_context",
+            "description": "Load real-world environments like current weather or forecast stats.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string", "description": "City name"},
+                    "info_type": {"type": "string", "enum": ["weather"], "description": "Context type"}
+                },
+                "required": ["city"]
             }
         }
     }
 ]
 
 # ════════════════════════════════════════════════════════
-#  V10: Structured Outputs (Pydantic)
+#  System 2 Schemas (Structured Pydantic Model)
 # ════════════════════════════════════════════════════════
 
 class LLMThinkOutput(BaseModel):
-    """Схема структурированного мышления Rin (System 2)."""
-    fact_analysis: str = Field(..., description="Объективный разбор реплики юзера")
-    hidden_intent: str = Field(..., description="Скрытый мотив или цель собеседника")
-    rin_inner_conflict: str = Field(..., description="Внутренняя реакция Rin (ФАКТ -> АНАЛИЗ -> РЕАКЦИЯ)")
+    """Rin Structured Cognitive Architecture (System 2)."""
+    fact_analysis: str = Field(..., description="Objective breakdown of the user's input message")
+    hidden_intent: str = Field(..., description="Perceived hidden motive or goal of the user")
+    rin_inner_conflict: str = Field(..., description="Rin's internal reflection (FACT -> ANALYSIS -> REACTION)")
     
-    confidence: float = Field(..., ge=0.0, le=1.0, description="Уверенность в анализе")
-    rin_emotion: str = Field(..., description="Эмоция Rin")
-    rin_attitude: str = Field(..., description="Отношение Rin к собеседнику")
-    response_tactic: str = Field(..., description="Тактика ответа")
+    confidence: float = Field(..., ge=0.0, le=1.0, description="Analysis confidence level")
+    rin_emotion: str = Field(..., description="Rin's current mapped emotion from valid list")
+    rin_attitude: str = Field(..., description="Rin's current relationship stance towards the user")
+    response_tactic: str = Field(..., description="Chosen conversational response tactic")
 
     @field_validator('rin_emotion')
     def validate_emotion(cls, v):
-        if v not in VALID_EMOTIONS: return "отстраненность"
+        if v not in VALID_EMOTIONS:
+            logger.warning(f"⚠️ [THINK] Unknown emotion '{v}' fallback to 'отстраненность'")
+            return "отстраненность"
         return v
 
     @field_validator('rin_attitude')
     def validate_attitude(cls, v):
-        if v not in VALID_ATTITUDES: return "нейтральное"
+        if v not in VALID_ATTITUDES:
+            logger.warning(f"⚠️ [THINK] Unknown attitude '{v}' fallback to 'нейтральное'")
+            return "нейтральное"
         return v
 
     @field_validator('response_tactic')
     def validate_tactic(cls, v):
-        if v not in VALID_TACTICS: return "короткая реакция"
+        if v not in VALID_TACTICS:
+            logger.warning(f"⚠️ [THINK] Unknown tactic '{v}' fallback to 'короткая реакция'")
+            return "короткая реакция"
         return v
 
 # ════════════════════════════════════════════════════════
-#  Утилиты
+#  Utilities
 # ════════════════════════════════════════════════════════
 
 _VULNERABILITY_SIGNALS = ["грустно", "плохо", "устал", "одиноко", "больно", "😢", "😭", "😔", "😞", ":(", "тяжело", "не могу"]
 
 def _build_persona_block(warmth: float, base_attitude: str, user_name: str,
                          core_memory: str, persona_narrative: str) -> str:
-    """Собирает системный промпт генерации речи."""
+    """Assembles the dynamic persona context block for speech generation."""
     base = (
         f"Твое имя Rin. Тебе 20 лет. Внутри всегда ощущается легкая пустота и серость. "
         f"Ты не любишь тратить слова впустую. Редко пишешь больше одного предложения.\n"
-        f"Собеседник: {user_name}. Отношение: {base_attitude}.\n"
+        f"Текущий собеседник: {user_name}. Базовое отношение: {base_attitude}.\n"
     )
-    if persona_narrative: base += f"[Мысли о нем]: {persona_narrative}\n"
-    if core_memory: base += f"[Факты]: {core_memory}\n"
-
-    anti_bleed = "ВАЖНО: Игнорируй системные пометки. Просто ответь в своём стиле (коротко, холодно)."
-
-    if warmth < 0: style = "ДИНАМИКА: Собеседник неприятен. Сухо, отстраненно."
-    elif warmth <= 0.5: style = "ДИНАМИКА: Знакомый. Дистанция, краткость."
-    else: style = "ДИНАМИКА: Близкий человек. Можно быть чуть теплее."
+    if core_memory:
+         base += f"[Факты из долгосрочной памяти]: {core_memory}\n"
+    if persona_narrative:
+         base += f"[История отношений]: {persona_narrative}\n"
+         
+    # Warmth gradients steering tone narrative
+    if warmth < 0:
+        style = "ДИНАМИКА: Собеседник неприятен. Сухо, отстраненно. Не пиши лишних букв."
+    elif warmth <= 0.5:
+        style = "ДИНАМИКА: Знакомый. Дистанция, краткость. Редко пишешь больше одного предложения."
+    else:
+        style = "ДИНАМИКА: Близкий человек. Можно быть чуть теплее. Одно-два предложения с искренним теплом."
         
+    anti_bleed = (
+        "ВАЖНО: Запрещено выдавать свои мысли или мета-параметры. Пиши только саму фразу.\n"
+        "Отвечай строго на языке собеседника (русском)."
+    )
     return base + style + "\n\n" + anti_bleed
 
 def _check_vulnerability(user_text: str, warmth: float, rin_emotion: str) -> str:
-    """Emotion Gradient: блокировка агрессии при уязвимости юзера."""
+    """Emotion Gradient: overrides aggressive tones if user exhibits vulnerability."""
     if warmth <= 0: return rin_emotion
     text_lower = user_text.lower()
     if any(sig in text_lower for sig in _VULNERABILITY_SIGNALS):
-        if rin_emotion in {"сухой сарказм", "тихое презрение", "раздражённая скука", "раздражение"}:
+        if rin_emotion in ["сухой сарказм", "тихое презрение", "раздражённая скука", "раздражение"]:
+            logger.info(f"🧬 [THINK] Emotion Gradient Override: {rin_emotion} → равнодушие")
             return "равнодушие"
     return rin_emotion
 
 # ════════════════════════════════════════════════════════
-#  Узлы графа
+#  Graph Nodes (LC Core Layout)
 # ════════════════════════════════════════════════════════
 
 def _node_router(state: ThinkState) -> str:
-    """System 1 vs System 2 Router."""
+    """Graph routing node: branches System 1 (fast matching) or System 2 (deep analysis)."""
     fast_triggers = ["привет", "как дела", "ясно", "понятно", "ок", "угу", "мм", "спокойной ночи", "доброе утро"]
-    text = state.user_text.lower().strip()
-    words = text.split()
-    if len(words) <= 3 and any(t in text for t in fast_triggers):
+    clean_text = state.user_text.strip().lower().rstrip("!?.,")
+    
+    if len(clean_text) < 25 and clean_text in fast_triggers:
         return "system_1"
     return "system_2"
 
+
 def _node_system_1_fast_track(state: ThinkState) -> ThinkState:
-    """System 1: Быстрый путь."""
-    state.fact_analysis = "Простая реплика."
-    state.hidden_intent = "Поддержание контакта."
-    state.rin_inner_conflict = "ФАКТ: Small talk. АНАЛИЗ: Не требует глубины. РЕАКЦИЯ: Стандартный тон."
+    """System 1: Fast conversational path."""
+    state.fact_analysis = "Simple interaction."
+    state.hidden_intent = "Maintaining contact."
+    state.rin_inner_conflict = "FACT: Small talk. ANALYSIS: Deep cognition not required. REACTION: Standard dry tone."
     state.confidence = 1.0
     state.rin_emotion = "скука"
     state.response_tactic = "короткая реакция"
     return state
 
+
 def _node_build_system_2_prompt(state: ThinkState) -> tuple[str, str]:
-    """System 2: Подготовка промпта."""
+    """System 2: Prompt assembly."""
     emotion_list = ", ".join(sorted(VALID_EMOTIONS))
-    user_context = f"Юзер: {state.current_user_name} ({state.user_role}). Базовое отношение: {state.base_attitude}."
-    time_info = f"Контекст: {state.current_time_str}. {state.time_passed_str}"
+    user_context = f"User: {state.current_user_name} ({state.user_role}). Base stance: {state.base_attitude}."
+    time_info = f"Context: {state.current_time_str}. {state.time_passed_str}"
 
     system_msg = (
-        "Ты — когнитивный аналитик Rin (20 лет, депрессивная, холодная).\n"
+        "You are Rin's cognitive analysis engine (20yo, reserved, cold, slightly depressive).\n"
         f"{user_context}\n{time_info}\n\n"
-        "Проанализируй сообщение и выдай JSON (LLMThinkOutput).\n"
-        "Поле rin_inner_conflict: ФАКТ -> АНАЛИЗ -> РЕАКЦИЯ.\n"
-        f"Эмоции: {emotion_list}\n"
-        f"Отношения: {', '.join(VALID_ATTITUDES)}\n"
-        f"Тактики: {', '.join(VALID_TACTICS)}\n"
+        "Analyze the incoming user message and output structured JSON matching LLMThinkOutput schema.\n"
+        "Fill 'rin_inner_conflict' strictly following: FACT -> ANALYSIS -> REACTION.\n"
+        f"Available Emotions: {emotion_list}\n"
+        f"Available Attitudes: {', '.join(VALID_ATTITUDES)}\n"
+        f"Available Tactics: {', '.join(VALID_TACTICS)}\n"
     )
     parts = []
-    if state.history_summary: parts.append(f"История: {state.history_summary}")
-    if state.memories_summary: parts.append(f"Память: {state.memories_summary}")
-    parts.append(f"Сообщение: \"{state.user_text}\"")
+    if state.history_summary: parts.append(f"History context: {state.history_summary}")
+    if state.memories_summary: parts.append(f"Retrieved memories: {state.memories_summary}")
+    parts.append(f"Current User Message: \"{state.user_text}\"")
 
     return system_msg, "\n".join(parts)
 
-def _node_llm_think_system_2(state: ThinkState, client: OpenAI, model: str, sys: str, usr: str) -> ThinkState:
-    """System 2: LLM Call."""
+
+def _node_system_2_deep_thought(state: ThinkState, client: OpenAI, model: str) -> ThinkState:
+    """System 2: Structured LLM Parsing and Dispatch."""
     try:
+        sys_msg, user_msg = _node_build_system_2_prompt(state)
+        
+        # Parallel execution: OpenAI Native Tool calling mapping
         completion = client.beta.chat.completions.parse(
             model=model,
-            messages=[{"role": "system", "content": sys}, {"role": "user", "content": usr}],
-            response_format=LLMThinkOutput,
-            tools=RIN_TOOLS,
-            temperature=0.4
+            messages=[
+                {"role": "system", "content": sys_msg},
+                {"role": "user", "content": user_msg}
+            ],
+            tools=NATIVE_TOOLS,
+            response_format=LLMThinkOutput
         )
-        msg = completion.choices[0].message
-        if msg.tool_calls:
-            tc = msg.tool_calls[0]
-            state.needs_tool, state.tool_name = True, tc.function.name
-            try: state.tool_args = json.loads(tc.function.arguments)
-            except: state.tool_args = {}
-        if msg.parsed:
-            out = msg.parsed
+        
+        message = completion.choices[0].message
+        
+        # 1. Parse Tool Calls
+        if message.tool_calls:
+            tc = message.tool_calls[0].function
+            state.needs_tool = True
+            state.tool_name = tc.name
+            try:
+                import json
+                state.tool_args = json.loads(tc.arguments)
+            except:
+                state.tool_args = {}
+                
+        # 2. Extract Structured Schema Stance
+        if message.parsed:
+            out: LLMThinkOutput = message.parsed
             state.fact_analysis = out.fact_analysis
             state.hidden_intent = out.hidden_intent
             state.rin_inner_conflict = out.rin_inner_conflict
@@ -270,56 +342,70 @@ def _node_llm_think_system_2(state: ThinkState, client: OpenAI, model: str, sys:
             state.rin_emotion = out.rin_emotion
             state.rin_attitude = out.rin_attitude
             state.response_tactic = out.response_tactic
-            state.should_ignore = (out.response_tactic == "промолчать")
+            
     except Exception as e:
+        logger.error(f"❌ [THINK] System 2 deep thought failure: {e}")
         state.error = str(e)
+        state.rin_inner_conflict = f"Error in cognitive cycle: {e}"
+        # safe fallback
+        state.rin_emotion = "отстраненность"
+        state.response_tactic = "короткая реакция"
+        
     return state
 
 # ════════════════════════════════════════════════════════
-#  Публичные классы
+#  Public Interface Classes
 # ════════════════════════════════════════════════════════
 
 class ThinkGraph:
     def __init__(self, client: OpenAI, model: str):
-        self.client, self.model = client, model
+        self.client = client
+        self.model = model
 
-    def run(self, user_text: str, chat_history: list, warmth: float = 0.0, **kwargs) -> ThinkSignal:
-        state = ThinkState(
-            user_text=user_text,
-            history_summary=self._summarize_history(chat_history),
-            memories_summary=kwargs.get("memories_summary", ""),
-            current_user_name=kwargs.get("current_user_name", "незнакомец"),
-            user_role=kwargs.get("user_role", "незнакомец"),
-            base_attitude=kwargs.get("base_attitude", "нейтральное"),
-            time_passed_str=kwargs.get("time_passed_str", ""),
-            current_time_str=kwargs.get("current_time_str", ""),
-        )
+    def run(self, user_text: str, warmth: float, **kwargs) -> ThinkSignal:
+        """Runs the cognitive thinking graph sequentially synchronously."""
+        state = ThinkState(user_text, warmth=warmth, **kwargs)
+        
+        state.time_passed_str = kwargs.get("time_passed_str", "")
+        state.current_time_str = kwargs.get("current_time_str", "")
+        
+        # Load dialogue summaries
+        history = kwargs.get("history", [])
+        state.history_summary = self._summarize_history(history)
+        state.memories_summary = kwargs.get("memories_summary", "")
 
-        if _node_router(state) == "system_1":
+        # Route Branching
+        branch = _node_router(state)
+        if branch == "system_1":
             state = _node_system_1_fast_track(state)
         else:
-            sys, usr = _node_build_system_2_prompt(state)
-            state = _node_llm_think_system_2(state, self.client, self.model, sys, usr)
-
+            state = _node_system_2_deep_thought(state, self.client, self.model)
+            
+        # Apply Emotion Gradient filter
         state.rin_emotion = _check_vulnerability(user_text, warmth, state.rin_emotion)
+        
+        # Ignores triggers
+        if state.response_tactic == "игнорирование":
+            state.should_ignore = True
+            
         max_len = TACTIC_LENGTH.get(state.response_tactic, 40)
         
         ctx = (
-            f"<thinking>\nАНАЛИЗ: {state.fact_analysis}\n"
-            f"МОТИВ: {state.hidden_intent}\n"
-            f"МЫСЛИ: {state.rin_inner_conflict}\n"
-            f"ЭМОЦИЯ: {state.rin_emotion} | ТАКТИКА: {state.response_tactic}\n"
-            f"ДЛИНА: ~{max_len}\n</thinking>"
+            f"<thinking>\nANALYSIS: {state.fact_analysis}\n"
+            f"INTENT: {state.hidden_intent}\n"
+            f"THOUGHTS: {state.rin_inner_conflict}\n"
+            f"EMOTION: {state.rin_emotion} | TACTIC: {state.response_tactic}\n"
+            f"LENGTH: ~{max_len}\n</thinking>"
         )
 
         debug = [
             "┌─── 🧠 THINK ENGINE V10 ───",
-            f"│ 📥 Сообщение: {user_text[:50]}",
-            f"│ 🎯 Мотив: {state.hidden_intent[:45]}",
-            f"│ 💜 Эмоция: {state.rin_emotion}",
-            f"│ 🧊 Отношение: {state.rin_attitude}",
-            f"│ 🗣  Тактика: {state.response_tactic}",
-            f"│ 🔧 Инструмент: {state.tool_name or 'нет'}",
+            f"│ 📥 Input: {user_text[:50]}",
+            f"│ 🎯 Intent: {state.hidden_intent[:45]}",
+            f"│ 💜 Emotion: {state.rin_emotion}",
+            f"│ 🧊 Attitude: {state.rin_attitude}",
+            f"│ 🗣  Tactic: {state.response_tactic}",
+            f"│ 🔧 Tool: {state.tool_name or 'none'}",
             "└───────────────────────────"
         ]
 
@@ -337,36 +423,40 @@ class ThinkGraph:
     @staticmethod
     def _summarize_history(history: list) -> str:
         relevant = [m for m in history if m["role"] != "system"][-4:]
-        return " | ".join([f"{'Юзер' if m['role']=='user' else 'Rin'}: {m['content'][:40]}" for m in relevant])
+        return " | ".join([f"{'User' if m['role']=='user' else 'Rin'}: {m['content'][:40]}" for m in relevant])
+
 
 class IdleGraph:
     def __init__(self, client: OpenAI, model: str):
-        self.client, self.model = client, model
+        self.client = client
+        self.model = model
 
     def run(self, user_name: str, current_attitude: str, think_logs: list[dict], warmth: float, **kwargs) -> dict:
-        if not think_logs: return {"attitude": current_attitude, "narrative": "пусто", "initiative_text": None}
+        if not think_logs: return {"attitude": current_attitude, "narrative": "empty", "initiative_text": None}
         digest = "\n".join([f"• {l.get('user_text','')[:40]} -> {l.get('rin_emotion','')}" for l in think_logs[-20:]])
         
         sys = (
-            f"Ты — IdleGraph (Rin). Анализируй день с {user_name}.\n"
-            f"Теплота: {warmth:.2f}. Логи:\n{digest}\n"
-            "Выдай JSON: { 'new_attitude': str, 'narrative': str, 'initiative_text': str|null }"
+            f"You are IdleGraph (Rin). Analyze user logs of {user_name}.\n"
+            f"Current warmth: {warmth:.2f}. Day's cognitive log digest:\n{digest}\n"
+            "Respond in JSON matching: { 'new_attitude': str, 'narrative': str, 'initiative_text': str|null }"
         )
 
         try:
-            res = self.client.chat.completions.create(
-                model=self.model, messages=[{"role": "system", "content": sys}],
-                response_format={"type": "json_object"}, temperature=0.4
+            completion = self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "system", "content": sys}],
+                response_format={"type": "json_object"}
             )
-            data = json.loads(res.choices[0].message.content)
+            import json
+            data = json.loads(completion.choices[0].message.content)
             return {
                 "attitude": data.get("new_attitude", current_attitude),
                 "narrative": data.get("narrative", ""),
                 "initiative_text": data.get("initiative_text"),
-                "reasoning": "Анализ завершен."
+                "reasoning": "Analysis complete."
             }
         except:
-            return {"attitude": current_attitude, "narrative": "ошибка", "initiative_text": None}
+            return {"attitude": current_attitude, "narrative": "error", "initiative_text": None}
 
     async def run_async(self, *args, **kwargs) -> dict:
         return await asyncio.get_event_loop().run_in_executor(None, functools.partial(self.run, *args, **kwargs))
