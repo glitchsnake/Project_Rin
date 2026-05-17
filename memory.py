@@ -116,10 +116,40 @@ def save_to_memory(
     """
     if not is_memory_available():
         return
+        
+    # Ограничение размера входного текста (защита от гигантских мусорных текстов)
+    content = content[:1000]
+    
     if not _is_important(role, content):
         return
 
     try:
+        # Квота памяти: не более 500 записей на одного пользователя (FIFO вытеснение)
+        try:
+            user_docs = _collection.get(where={"user_id": user_id}, include=["metadatas"])
+            if user_docs and user_docs["ids"] and len(user_docs["ids"]) >= 500:
+                oldest_id = None
+                oldest_time = None
+                for doc_id, meta in zip(user_docs["ids"], user_docs["metadatas"]):
+                    ts_str = meta.get("timestamp") or meta.get("last_seen_timestamp")
+                    if ts_str:
+                        try:
+                            ts = datetime.fromisoformat(ts_str)
+                            if oldest_time is None or ts < oldest_time:
+                                oldest_time = ts
+                                oldest_id = doc_id
+                        except Exception:
+                            oldest_id = doc_id
+                            break
+                    else:
+                        oldest_id = doc_id
+                        break
+                if oldest_id:
+                    _collection.delete(ids=[oldest_id])
+                    logger.info(f"🗑️ [MEMORY] Превышена квота (500) для {user_id}. Удалена старая запись: {oldest_id}")
+        except Exception as quota_err:
+            logger.warning(f"⚠️ [MEMORY] Ошибка проверки квоты: {quota_err}")
+
         embedding = _embed(content)
         
         # Семантическая проверка на дубликаты (V10)

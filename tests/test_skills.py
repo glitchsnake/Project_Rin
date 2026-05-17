@@ -31,9 +31,11 @@ class TestSkills(unittest.IsolatedAsyncioTestCase):
         res = await execute_python(safe_code)
         self.assertIn("4", res)
 
+    @patch('skills.is_docker_available')
     @patch('skills.asyncio.wait_for')
-    async def test_execute_python_timeout(self, mock_wait_for):
+    async def test_execute_python_timeout(self, mock_wait_for, mock_is_docker):
         """Verify that infinite loops or slow scripts are stopped by timeout."""
+        mock_is_docker.return_value = False
         mock_wait_for.side_effect = asyncio.TimeoutError()
         slow_code = "import time\nwhile True:\n    time.sleep(1)"
         res = await execute_python(slow_code)
@@ -69,3 +71,48 @@ class TestSkills(unittest.IsolatedAsyncioTestCase):
         res = await execute_tool_async("search_wikipedia", {"query": "Python"})
         self.assertIn("Python", res)
         self.assertIn("Python is a high-level programming language.", res)
+
+    @patch('skills.is_docker_available')
+    @patch('skills.asyncio.create_subprocess_exec')
+    async def test_execute_python_docker_success(self, mock_create, mock_is_docker):
+        """Verify that Python execution via Docker sandbox runs cleanly."""
+        mock_is_docker.return_value = True
+        
+        # Mock docker process
+        mock_proc = MagicMock()
+        mock_proc.returncode = 0
+        async def mock_communicate():
+            return b"docker output\n", b""
+        mock_proc.communicate = mock_communicate
+        
+        mock_create.return_value = mock_proc
+        
+        res = await execute_python("print('hello')")
+        # Ensure it tried to run "docker"
+        self.assertEqual(mock_create.call_args[0][0], "docker")
+        self.assertIn("docker output", res)
+
+    @patch('skills.is_docker_available')
+    @patch('skills.asyncio.create_subprocess_exec')
+    async def test_execute_python_docker_fallback(self, mock_create, mock_is_docker):
+        """Verify that if Docker daemon is missing or errors out, sandbox falls back to subprocess."""
+        mock_is_docker.return_value = True
+        
+        # Mock docker call raising FileNotFoundError (e.g. docker not installed)
+        # And next subprocess call succeeding
+        mock_docker_proc = MagicMock()
+        mock_docker_proc.returncode = 125 # Docker error
+        async def mock_docker_communicate():
+            return b"", b"docker failed"
+        mock_docker_proc.communicate = mock_docker_communicate
+        
+        mock_sub_proc = MagicMock()
+        mock_sub_proc.returncode = 0
+        async def mock_sub_communicate():
+            return b"subprocess fallback output\n", b""
+        mock_sub_proc.communicate = mock_sub_communicate
+        
+        mock_create.side_effect = [mock_docker_proc, mock_sub_proc]
+        
+        res = await execute_python("print('hello')")
+        self.assertIn("subprocess fallback output", res)

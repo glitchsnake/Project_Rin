@@ -200,11 +200,50 @@ async def _transcribe_voice(file_bytes: bytes) -> str:
         return ""
 
 
+# ── [Rate Limiter] ───────────────────────────────────────
+# Хранит времена последних сообщений каждого пользователя: {chat_id: [datetime]}
+_user_message_times: dict[int, list[datetime]] = {}
+RATE_LIMIT_SECONDS = 3.0  # минимум 3 секунды между запросами
+
+def _check_rate_limit(chat_id: int) -> bool:
+    """Проверяет превышение лимита запросов. Возвращает True, если запрос разрешен."""
+    now = datetime.now()
+    
+    # Автоматическая чистка словаря от старых записей
+    if random.random() < 0.05:
+        limit_time = now - timedelta(hours=1)
+        for cid, t_list in list(_user_message_times.items()):
+            cleaned = [t for t in t_list if t > limit_time]
+            if not cleaned:
+                del _user_message_times[cid]
+            else:
+                _user_message_times[cid] = cleaned
+
+    if chat_id not in _user_message_times:
+        _user_message_times[chat_id] = [now]
+        return True
+    
+    times = _user_message_times[chat_id]
+    times = [t for t in times if now - t < timedelta(seconds=RATE_LIMIT_SECONDS)]
+    
+    if len(times) >= 1:
+        return False
+        
+    times.append(now)
+    _user_message_times[chat_id] = times
+    return True
+
+
 # ── Основная логика обработки текста ─────────────────────
 async def _process_text(message: types.Message, user_text: str, label: str = "") -> None:
     """Центральный pipeline — принимает финальный текст и прогоняет через ThinkGraph."""
     chat_id    = message.chat.id
     session_id = str(chat_id)
+
+    # ── [Rate Limiter Check] ─────────────────────────────
+    if not _check_rate_limit(chat_id):
+        logger.warning(f"⚠️ [RATE LIMIT] Запрос от {chat_id} проигнорирован (слишком часто)")
+        return
 
     # [1.4] Загружаем досье юзера
     username = message.from_user.first_name or "незнакомец"

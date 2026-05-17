@@ -171,7 +171,7 @@ class SpeechGraph:
         if tool_result:
             messages.append({"role": "system", "content": f"[Справка: {tool_result}]"})
 
-        messages.append({"role": "user", "content": user_text})
+        messages.append({"role": "user", "content": f"<user_message>{user_text}</user_message>"})
 
         # [V10.1] O(1) lookup
         logit_bias = build_generation_logit_bias(signal.warmth)

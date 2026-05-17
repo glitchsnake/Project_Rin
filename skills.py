@@ -71,8 +71,35 @@ async def search_wikipedia(query: str) -> str:
         return f"[Wikipedia Error: {e}]"
 
 
+_DOCKER_AVAILABLE = None
+
+async def is_docker_available() -> bool:
+    """Быстрая проверка доступности Docker daemon с кэшированием и тайм-аутом 1.5 сек."""
+    global _DOCKER_AVAILABLE
+    if _DOCKER_AVAILABLE is not None:
+        return _DOCKER_AVAILABLE
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "docker", "version",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL
+        )
+        try:
+            await asyncio.wait_for(proc.communicate(), timeout=1.5)
+            _DOCKER_AVAILABLE = (proc.returncode == 0)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except:
+                pass
+            _DOCKER_AVAILABLE = False
+    except Exception:
+        _DOCKER_AVAILABLE = False
+    return _DOCKER_AVAILABLE
+
+
 async def execute_python(code: str) -> str:
-    """Асинхронное выполнение Python-кода в подпроцессе (V10.3 Sandbox)."""
+    """Асинхронное выполнение Python-кода (V10.3 Sandbox с изоляцией Docker / Subprocess)."""
     BLOCKED = [
         "import os", "import sys", "import subprocess", "open(",
         "__import__", "exec(", "eval(", "shutil", "socket", "requests", 
@@ -83,8 +110,40 @@ async def execute_python(code: str) -> str:
         if b in code:
             return f"[SECURITY BLOCKED] Использование запрещенного модуля/функции: {b}"
             
+    # 1. Попытка изолированного запуска в контейнере Docker
+    if await is_docker_available():
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "docker", "run", "--rm", "--network", "none", "--cpus", "0.5", "-m", "50m", "python:3.10-alpine", "python", "-c", code,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            try:
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+                
+                # Возвращаемый код 125 означает ошибку самого демона докера (например, докер не запущен)
+                if proc.returncode == 125:
+                    raise RuntimeError("Docker daemon error (exit code 125)")
+                    
+                output = stdout.decode().strip()
+                error  = stderr.decode().strip()
+                
+                if error:
+                    return f"[Python Error]: {error[:300]}"
+                return output[:500] if output else "[Код выполнен успешно, нет вывода]"
+                
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                except:
+                    pass
+                return "[Python Error: Превышен лимит времени выполнения (5.0с)]"
+                
+        except Exception as docker_err:
+            logger.warning(f"⚠️ [SKILLS] Docker недоступен ({docker_err}). Переключаюсь на резервный subprocess...")
+        
+    # 2. Резервный запуск в изолированном локальном подпроцессе (если Docker отсутствует)
     try:
-        # Запуск асинхронного подпроцесса
         proc = await asyncio.create_subprocess_exec(
             sys.executable, "-c", code,
             stdout=asyncio.subprocess.PIPE,
@@ -92,7 +151,6 @@ async def execute_python(code: str) -> str:
         )
         
         try:
-            # Ожидание выполнения с таймаутом 5 секунд
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
             
             output = stdout.decode().strip()
