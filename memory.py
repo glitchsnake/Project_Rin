@@ -84,8 +84,16 @@ def _init_memory() -> bool:
         import chromadb
         from sentence_transformers import SentenceTransformer
         
-        # Setup persistent ChromaDB store
-        _client = chromadb.PersistentClient(path="rin_memory_db")
+        # Setup persistent ChromaDB store (standalone server or local fallback)
+        import os
+        chroma_host = os.getenv("CHROMA_HOST")
+        if chroma_host:
+            chroma_port = int(os.getenv("CHROMA_PORT", 8000))
+            logger.info(f"🔌 [MEMORY] Connecting to standalone ChromaDB server: {chroma_host}:{chroma_port}")
+            _client = chromadb.HttpClient(host=chroma_host, port=chroma_port)
+        else:
+            _client = chromadb.PersistentClient(path="rin_memory_db")
+            
         _collection = _client.get_or_create_collection(
             name="rin_dialog_memory",
             metadata={"hnsw:space": "cosine"}  # standard cosine distance

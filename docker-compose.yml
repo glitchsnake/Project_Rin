@@ -1,0 +1,58 @@
+version: '3.8'
+
+services:
+  # ── MAIN BOT SERVICE ───────────────────────────────────
+  rin-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rin-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - CHROMA_HOST=chromadb
+      - CHROMA_PORT=8000
+    volumes:
+      # Docker-out-of-Docker (DooD) socket binding for sandboxed runtimes
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Persistent SQLite session database binding
+      - ./rin_sessions.db:/app/rin_sessions.db
+      # Local fallback persistent memory storage binding
+      - ./rin_memory_db:/app/rin_memory_db
+    depends_on:
+      chromadb:
+        condition: service_healthy
+
+  # ── STANDALONE CHROMADB VECTOR STORE ───────────────────
+  chromadb:
+    image: chromadb/chroma:latest
+    container_name: rin-chromadb
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - chromadb-data:/chroma/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/heartbeat"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── SQLITE WEB DIAGNOSTIC DASHBOARD ────────────────────
+  sqlite-web:
+    image: coleifer/sqlite-web
+    container_name: rin-sqlite-web
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./rin_sessions.db:/data/rin_sessions.db
+    environment:
+      - SQLITE_DATABASE=rin_sessions.db
+    depends_on:
+      - rin-bot
+
+volumes:
+  chromadb-data:
+    driver: local
