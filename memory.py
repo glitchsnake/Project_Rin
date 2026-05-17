@@ -10,6 +10,7 @@ memory.py — Долгосрочная векторная память Rin (V10)
 
 import asyncio
 import logging
+import os
 from datetime import datetime
 from typing import Optional, List
 import tiktoken
@@ -46,7 +47,14 @@ def _init_memory() -> bool:
         import chromadb
         from sentence_transformers import SentenceTransformer
 
-        _chroma_client = chromadb.PersistentClient(path="./rin_memory_db")
+        chroma_host = os.getenv("CHROMA_HOST")
+        if chroma_host:
+            chroma_port = int(os.getenv("CHROMA_PORT", 8000))
+            logger.info(f"🔌 [MEMORY] Подключение к удаленному ChromaDB серверу: {chroma_host}:{chroma_port}")
+            _chroma_client = chromadb.HttpClient(host=chroma_host, port=chroma_port)
+        else:
+            _chroma_client = chromadb.PersistentClient(path="./rin_memory_db")
+
         _collection = _chroma_client.get_or_create_collection(
             name="rin_memories",
             metadata={"hnsw:space": "cosine"},
