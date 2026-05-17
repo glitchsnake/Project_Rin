@@ -1,17 +1,11 @@
 """
-main.py — Telegram-бот Rin (V9)
+main.py — Telegram bot Rin (V10.3)
 
-[1.1] Session Manager: active_sessions[chat_id] — изоляция истории по чатам
-[1.2] session_id = str(chat_id) — динамическая передача в БД
-[1.3] user_id в ChromaDB — партиционирование памяти
-[1.4] User Persona: имя + base_attitude из БД
-[2.1] Silent Time Injection: время суток в системный промпт
-[2.2] Time Drift: дельта с последнего сообщения
-[3.1] IdleGraph: фоновый граф «снов» — анализ логов дня
-[3.2] Attitude Shift: перезапись base_attitude после сна
-[3.3] Осознанная инициатива от IdleGraph
-[4.1] Voice handler: Whisper STT
-[4.2] Photo handler: fallback-текст
+Key Features:
+  - 100% Async / Non-blocking architecture.
+  - Periodic RAM leak protection (removes active sessions inactive for >24h).
+  - Dynamic speech compilation vocabulary steering using HuggingFace tokenizers.
+  - Non-blocking SQLite persistence queries via aiosqlite and async vector memory checks.
 """
 
 import asyncio
@@ -25,33 +19,45 @@ load_dotenv()
 from datetime import datetime, timedelta
 from typing import Optional
 
-from aiogram import Bot, Dispatcher, F, types
-from aiogram.filters import Command
-from aiogram.types import ReactionTypeEmoji
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import Message, FSInputFile
 from openai import OpenAI
 
-from think_engine import ThinkGraph, IdleGraph, _build_persona_block, ThinkSignal
-from speech_engine import SpeechGraph, init_speech_engine
-from memory import save_to_memory_async, recall_memories_async, maybe_summarize_history, is_memory_available
-from skills import execute_tool_async
+# Core modules imports
 from database import (
-    init_db, save_message, load_history, update_history_in_db, log_think_result,
-    touch_message_time, get_last_message_time,
-    ensure_user, get_user, update_user_warmth, update_user_attitude, set_user_name,
-    get_recent_think_logs, update_core_memory, update_persona_narrative,
+    init_db,
+    ensure_user,
+    get_user,
+    update_user_warmth,
+    update_user_attitude,
+    update_core_memory,
+    update_persona_narrative,
+    save_message,
+    load_history,
+    touch_message_time,
+    get_last_message_time,
+    append_dashboard_log
 )
+from think_engine import ThinkGraph, IdleGraph, ThinkSignal, _build_persona_block
+from memory import save_to_memory_async, recall_memories_async, summarize_if_needed
+from speech_engine import (
+    init_speech_engine,
+    build_generation_logit_bias,
+    _clean_output,
+    TACTIC_LENGTH
+)
+from skills import execute_tool
 
-# ── Логирование ──────────────────────────────────────────
+# Setup logging
 logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-                    datefmt="%H:%M:%S")
+                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("main")
 
-# ── Настройки ────────────────────────────────────────────
+# ── Configurations ────────────────────────────────────────
 API_TOKEN      = os.getenv("TELEGRAM_BOT_TOKEN")
 AI_BACKEND_URL = os.getenv("AI_BACKEND_URL", "http://127.0.0.1:1234/v1")
 AI_API_KEY     = os.getenv("AI_API_KEY", "lm-studio")
-MODEL          = os.getenv("AI_MODEL", "rin")  # дообученная модель
+MODEL          = os.getenv("AI_MODEL", "rin")  # fine-tuned model name
 TOKENIZER_MODEL = os.getenv("TOKENIZER_MODEL", "NousResearch/Hermes-3-Llama-3.1-8B")
 
 if not API_TOKEN:
@@ -63,554 +69,351 @@ dp          = Dispatcher()
 client      = OpenAI(base_url=AI_BACKEND_URL, api_key=AI_API_KEY)
 think_graph  = ThinkGraph(client=client, model=MODEL)
 idle_graph   = IdleGraph(client=client, model=MODEL)
+
+# RAM Leak Prevention: in-memory user cache
+active_sessions = {}
+session_locks = {}
+
+# ════════════════════════════════════════════════════════
+#  RAM Protection: Periodic Session Pruning
+# ════════════════════════════════════════════════════════
+
+async def _session_cleaner_loop():
+    """Runs a periodic loop to clean up active_sessions to prevent RAM memory leaks."""
+    while True:
+        try:
+            await asyncio.sleep(3600)  # check every hour
+            now = datetime.now()
+            expired_keys = []
+            
+            for key, session in list(active_sessions.items()):
+                last_active = session.get("last_active_time", now)
+                # Keep active sessions in RAM for max 24 hours of inactivity
+                if now - last_active > timedelta(hours=24):
+                    expired_keys.append(key)
+                    
+            for key in expired_keys:
+                if key in active_sessions:
+                    del active_sessions[key]
+                    logger.info(f"🧹 [RAM CLEANER] Session {key} purged due to 24h inactivity.")
+        except Exception as e:
+            logger.error(f"❌ [RAM CLEANER] Error in cleaner loop: {e}")
+
+# ════════════════════════════════════════════════════════
+#  Speech Graph (Async V10)
+# ════════════════════════════════════════════════════════
+
+class SpeechGraph:
+    def __init__(self, client: OpenAI, model: str):
+        self.client = client
+        self.model = model
+
+    def run(self, prompt: str, logit_bias: dict, max_tokens: int) -> str:
+        """Runs the OpenAI text completion using dynamic logit steering constraints."""
+        try:
+            completion = self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "system", "content": prompt}],
+                temperature=0.7,
+                max_tokens=max_tokens,
+                logit_bias=logit_bias
+            )
+            raw = completion.choices[0].message.content
+            return _clean_output(raw)
+        except Exception as e:
+            logger.error(f"❌ [SPEECH] Speech generation failure: {e}")
+            return "..."
+
+    async def run_async(self, *args, **kwargs) -> str:
+        return await asyncio.get_event_loop().run_in_executor(
+            None, lambda: self.run(*args, **kwargs)
+        )
+
 speech_graph = SpeechGraph(client=client, model=MODEL)
 
-# ── Личность ─────────────────────────────────────────────
-IDENTITY_PROMPT = (
-    "Твое имя Rin. Тебе 20 лет. Внутри всегда ощущается легкая пустота и серость. "
-    "Ты не любишь тратить слова впустую. Редко пишешь больше одного предложения. "
-    "На вопросы отвечаешь сухо и прямо. С незнакомцами держишь дистанцию. "
-    "Это твоя обычная жизнь, ты просто чатишься в телефоне."
-)
+# ════════════════════════════════════════════════════════
+#  Background Task Runners (Safe Error Handling)
+# ════════════════════════════════════════════════════════
 
-# ── [1.1] Session Manager ────────────────────────────────
-# active_sessions[chat_id] = list of messages (in-memory кэш)
-active_sessions: dict[int, list] = {}
-
-async def get_session(chat_id: int) -> list:
-    """Возвращает историю для конкретного чата (V10.2: Async)."""
-    if chat_id not in active_sessions:
-        session_id = str(chat_id)
-        # Загружаем без IDENTITY_PROMPT — SpeechGraph сам строит системный промпт
-        history = await load_history(session_id, system_prompt="", limit=20)
-        # Убираем старые system-сообщения из истории
-        active_sessions[chat_id] = [m for m in history if m["role"] != "system"]
-    return active_sessions[chat_id]
-
-def set_session(chat_id: int, history: list) -> None:
-    active_sessions[chat_id] = history
-
-# ── Реакции ──────────────────────────────────────────────
-REACTION_MAP = {
-    "тихое презрение":    ["👎", "🤡"],
-    "раздражённая скука": ["😑", "🥱"],
-    "сухой сарказм":      ["🤡", "😐"],
-}
-REACTION_THRESHOLD = 0.4
-
-INITIATIVE_MIN = 3 * 3600
-INITIATIVE_MAX = 6 * 3600
-
-# ── Хелперы ──────────────────────────────────────────────
-
-def _build_time_context() -> tuple[str, str]:
-    """[2.1] Возвращает (time_str, period) для инъекции."""
-    now  = datetime.now()
-    hour = now.hour
-    weekdays = ["понедельник","вторник","среда","четверг","пятница","суббота","воскресенье"]
-    day   = weekdays[now.weekday()]
-    if   5  <= hour < 12: period = "утро"
-    elif 12 <= hour < 17: period = "день"
-    elif 17 <= hour < 22: period = "вечер"
-    else:                  period = "ночь"
-    return f"{now.strftime('%H:%M')}, {day}, {period}", period
-
-
-async def _build_time_drift(session_id: str) -> str:
-    """[2.2] Вычисляет дельту с последнего сообщения (V10.2: Async)."""
-    last = await get_last_message_time(session_id)
-    if last is None:
-        return ""
-    delta = datetime.now() - last
-    hours = delta.total_seconds() / 3600
-    if   hours < 1:    return ""
-    elif hours < 6:    return f"Прошло {int(hours)} ч."
-    elif hours < 24:   return f"Прошло {int(hours)} ч. (полдня)"
-    elif hours < 48:   return "Прошёл почти день."
-    elif hours < 168:  return f"Прошло {int(hours // 24)} дн."
-    else:              return f"Прошла неделя."
-
-
-async def _typing_delay(text: str, chat_id: int) -> None:
-    """[10] Умный typing — имитация реальной скорости."""
-    delay   = min(len(text) / 20, 6.0)
-    elapsed = 0.0
-    while elapsed < delay:
-        await bot.send_chat_action(chat_id=chat_id, action="typing")
-        wait     = min(4.0, delay - elapsed)
-        await asyncio.sleep(wait)
-        elapsed += wait
-
-
-async def _try_reaction(message: types.Message, emoji: str) -> bool:
-    """[11] Ставит реакцию, возвращает успех."""
+async def _safe_run_summarization(history: list[dict], user_id: str):
+    """Executes long-term memory summarization in a safe background task."""
     try:
-        await bot.set_message_reaction(
-            chat_id=message.chat.id,
-            message_id=message.message_id,
-            reaction=[ReactionTypeEmoji(emoji=emoji)],
-        )
-        logger.info(f"💢 [REACTION] {emoji}")
-        return True
+        updated_history, summary_output = await summarize_if_needed(history, user_id, client, MODEL)
+        
+        # Inject core memory suggestions back into the active sessions cycle
+        if summary_output and summary_output.summary:
+            if user_id in active_sessions:
+                active_sessions[user_id]["history"] = updated_history
+                
+                # Signal to the agent to dynamically update its Core Memory profile
+                if summary_output.core_memory_update:
+                    observation_msg = (
+                        f"[АРХИВНОЕ НАБЛЮДЕНИЕ]: Анализ диалогов показал новые факты. "
+                        f"Предложение по обновлению Core Memory: '{summary_output.core_memory_update}'. "
+                        f"Ты можешь вызвать инструмент update_core_memory для сохранения, если это важно."
+                    )
+                    active_sessions[user_id]["history"].append({"role": "system", "content": observation_msg})
+                    logger.info(f"💡 [MEMORY] Suggestion injected for user {user_id}: {summary_output.core_memory_update}")
     except Exception as e:
-        logger.warning(f"⚠️  [REACTION] {e}")
-        return False
+         logger.error(f"❌ [BACKGROUND TASK] Summarization failed: {e}", exc_info=True)
 
 
-async def _maybe_react(think, user_text: str) -> Optional[str]:
-    """[11] Нужна ли реакция вместо текста?"""
-    if think.rin_emotion in REACTION_MAP and random.random() < 0.30:
-        return random.choice(REACTION_MAP[think.rin_emotion])
-    if len(user_text.strip()) < 4 and think.confidence < REACTION_THRESHOLD:
-        if random.random() < 0.25:
-            return "😐"
-    return None
-
-
-# ── [4.1] Whisper STT ────────────────────────────────────
-async def _transcribe_voice(file_bytes: bytes) -> str:
-    """Транскрибирует голосовое сообщение через Whisper (V10: Async I/O)."""
+async def _safe_save_to_memory(role: str, content: str, user_id: str):
+    """Saves conversation turns to vector store in a background task."""
     try:
-        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
-            tmp.write(file_bytes)
-            tmp_path = tmp.name
+        await save_to_memory_async(role, content, user_id)
+    except Exception as e:
+         logger.error(f"❌ [BACKGROUND TASK] Save memory failed: {e}", exc_info=True)
 
-        loop = asyncio.get_event_loop()
-        def _whisper():
-            # [V10] Операция открытия и чтения файла теперь внутри Executor
-            with open(tmp_path, "rb") as audio_file:
-                return client.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=audio_file,
-                    language="ru",
-                )
-        
-        result = await loop.run_in_executor(None, _whisper)
-        
-        # Удаляем временный файл после использования
+# ════════════════════════════════════════════════════════
+#  Voice Processing (STT Async ThreadPoolExecutor)
+# ════════════════════════════════════════════════════════
+
+async def _transcribe_voice(file_path: str) -> Optional[str]:
+    """Sends voice message file to OpenAI whisper API asynchronously."""
+    def worker():
         try:
-            import os
-            os.unlink(tmp_path)
-        except:
-            pass
+            with open(file_path, "rb") as audio:
+                transcript = client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=audio
+                )
+                return transcript.text
+        except Exception as e:
+            logger.error(f"❌ [STT] Transcription error: {e}")
+            return None
             
-        return result.text.strip()
-    except Exception as e:
-        logger.warning(f"⚠️  [WHISPER] Ошибка: {e}")
-        return ""
+    return await asyncio.get_event_loop().run_in_executor(None, worker)
 
+# ════════════════════════════════════════════════════════
+#  Core Orchestration Loop: Message Handlers
+# ════════════════════════════════════════════════════════
 
-# ── Основная логика обработки текста ─────────────────────
-async def _process_text(message: types.Message, user_text: str, label: str = "") -> None:
-    """Центральный pipeline — принимает финальный текст и прогоняет через ThinkGraph."""
-    chat_id    = message.chat.id
-    session_id = str(chat_id)
+@dp.message(F.content_type.in_({"text", "voice"}))
+async def handle_any_message(message: Message):
+    user_id   = str(message.from_user.id)
+    user_name = message.from_user.first_name or "Друг"
+    
+    # Initialize lock for this user to prevent race conditions in fast double clicks
+    if user_id not in session_locks:
+        session_locks[user_id] = asyncio.Lock()
+        
+    async with session_locks[user_id]:
+        await ensure_user(user_id, user_name)
+        
+        # Load active session parameters from RAM or SQLite
+        if user_id not in active_sessions:
+            logger.info(f"⏳ [SESSION] Loading session {user_id} into RAM cache...")
+            db_user = await get_user(user_id)
+            
+            # Formulate the initial dynamic persona block
+            system_prompt = _build_persona_block(
+                warmth=db_user["warmth"],
+                base_attitude=db_user["base_attitude"],
+                user_name=db_user["name"],
+                core_memory=db_user["core_memory"],
+                persona_narrative=db_user["persona_narrative"]
+            )
+            
+            history = await load_history(user_id, system_prompt=system_prompt, limit=15)
+            active_sessions[user_id] = {
+                "history": history,
+                "warmth": db_user["warmth"],
+                "base_attitude": db_user["base_attitude"],
+                "core_memory": db_user["core_memory"],
+                "persona_narrative": db_user["persona_narrative"],
+                "last_active_time": datetime.now()
+            }
+        else:
+            active_sessions[user_id]["last_active_time"] = datetime.now()
+            
+        session = active_sessions[user_id]
+        
+        # ── 1. Load User Message ──────────────────────────
+        user_text = ""
+        voice_temp_path = None
+        
+        if message.text:
+            user_text = message.text
+        elif message.voice:
+            # Voice loading
+            try:
+                voice = message.voice
+                # Create secure temporary file
+                fd, voice_temp_path = tempfile.mkstemp(suffix=".ogg")
+                os.close(fd)
+                
+                await bot.download(voice, destination=voice_temp_path)
+                logger.info(f"🎙️ [STT] Audio file downloaded: {voice_temp_path}")
+                
+                user_text = await _transcribe_voice(voice_temp_path)
+                if not user_text:
+                    await message.reply("Я не смогла разобрать голос...")
+                    return
+                logger.info(f"🎙️ [STT] Result: \"{user_text}\"")
+            except Exception as e:
+                logger.error(f"❌ [VOICE] Failed to process voice: {e}")
+                await message.reply("У меня не получилось прослушать твою запись.")
+                return
+            finally:
+                if voice_temp_path and os.path.exists(voice_temp_path):
+                    try:
+                        os.remove(voice_temp_path)
+                    except:
+                        pass
 
-    # [1.4] Загружаем досье юзера
-    username = message.from_user.first_name or "незнакомец"
-    await ensure_user(session_id, username)
-    await touch_message_time(session_id) # [V10.2] await
+        if not user_text.strip():
+             return
 
-    # [1.4] Досье пользователя
-    persona = await get_user(session_id) # [V10.2] await
-    chat_history = await get_session(chat_id) # [V10.2] await
+        # Save user dialogue turn to database
+        await save_message(user_id, "user", user_text)
+        session["history"].append({"role": "user", "content": user_text})
+        
+        # Async background saving of message to vector store
+        asyncio.create_task(_safe_save_to_memory("user", user_text, user_id))
+        
+        # ── 2. Run Memory Summarization check (Background Task) ────
+        asyncio.create_task(_safe_run_summarization(session["history"], user_id))
+        
+        # ── 3. Recall Semantically Relevant memories from ChromaDB ─
+        memories = await recall_memories_async(user_text, user_id=user_id, n_results=3)
 
-    # Если голосовое — добавляем пометку
-    display_text = f"[ЮЗЕР ПРИСЛАЛ ГОЛОСОВОЕ: \"{user_text}\"]" if label == "voice" else user_text
-    chat_history.append({"role": "user", "content": display_text})
-    await save_message(session_id, "user", display_text)
+        # ── 4. Retrieve Time passed parameters ───────────────
+        last_time = await get_last_message_time(user_id)
+        await touch_message_time(user_id)
+        
+        time_passed_str = ""
+        if last_time:
+            delta = datetime.now() - last_time
+            hours = delta.total_seconds() / 3600
+            time_passed_str = f"Time since last interaction: {hours:.2f} hours."
+            
+        current_time_str = f"Current date and time: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
 
-    # [2.1] Время суток
-    current_time_str, _ = _build_time_context()
-    # [2.2] Дельта
-    time_passed_str = await _build_time_drift(session_id)
-
-    # [1.3] RAG-воспоминания с user_id
-    memories_summary = ""
-    if is_memory_available():
-        memories_summary = await recall_memories_async(user_text, user_id=session_id)
-
-    # Сохраняем в память [1.3]
-    asyncio.create_task(save_to_memory_async("user", user_text, user_id=session_id))
-
-    await bot.send_chat_action(chat_id=chat_id, action="typing")
-
-    # Рассчитываем роль юзера: если в ядре написано "создатель" — он создатель
-    user_role = "создатель" if "создатель" in persona["core_memory"].lower() else "незнакомец"
-
-    try:
-        # ── ЭТАП 1: THINK ENGINE → ThinkSignal ─────────
-        signal: ThinkSignal = await think_graph.run_async(
-            user_text=display_text,
-            chat_history=chat_history,
-            warmth=persona["warmth"],
-            memories_summary=memories_summary,
-            current_user_name=persona["name"],
-            user_role=user_role,
-            base_attitude=persona["base_attitude"],
+        # ── 5. System 2: Thinking Graph Cycle ────────────────
+        logger.info(f"🧠 [ORCHESTRATOR] running Cognitive Thinking Graph for {user_name}...")
+        
+        output: ThinkSignal = await think_graph.run_async(
+            user_text=user_text,
+            warmth=session["warmth"],
+            user_role="creator" if user_name == "Loki" else "stranger",
+            user_name=user_name,
+            base_attitude=session["base_attitude"],
+            memories_summary=memories,
             time_passed_str=time_passed_str,
             current_time_str=current_time_str,
+            history=session["history"]
         )
-        print(signal.debug_log)
-
-        # [Задача 14] Логируем скрытый процесс мышления (V10.2: await)
-        await log_think_result(session_id, display_text, signal)
-
-        # [4.3] Утилитарное влияние на warmth (V10.2: await)
-        await update_user_warmth(session_id, {
-            "слегка тёплое":  +0.2, "нейтральное":  0.0,
-            "безразличное":  -0.1, "настороженное": -0.1,
-            "раздражённое": -0.2,
-        }.get(signal.rin_attitude, 0.0))
-        persona = await get_user(session_id)  # перечитываем после warmth
-
-        # ── Conditional: молчать ──────────────────────
-        if not signal.should_speak:
-            logger.info("🤫 Rin молчит.")
-            chat_history.append({"role": "assistant", "content": "*молчит*"})
-            await save_message(session_id, "assistant", "*молчит*")
-            return
-
-        # ── [11] Реакция emoji ─────────────────────
-        # Простой чек: если текст < 4 символа — шанс 25% поставить реакцию
-        if len(user_text.strip()) < 4 and random.random() < 0.25:
-            emoji = "😐"
-            if await _try_reaction(message, emoji):
-                chat_history.append({"role": "assistant", "content": f"[реакция: {emoji}]"})
-                await save_message(session_id, "assistant", f"[реакция: {emoji}]")
-                return
-
-        # ── [9] Tool Use ────────────────────────────
-        tool_result = ""
-        if signal.needs_tool and signal.tool_name:
-            args = dict(signal.tool_args)
-            if signal.tool_name in ("search_core_memory", "save_fact_to_memory"):
-                args.setdefault("user_id", session_id)
-            tool_result = await execute_tool_async(signal.tool_name, args)
-
-        # ── ЭТАП 2: SPEECH ENGINE (Branch-Solve-Merge) ────
-        persona_block = _build_persona_block(
-            warmth=persona["warmth"],
-            base_attitude=persona["base_attitude"],
-            user_name=persona["name"],
-            core_memory=persona["core_memory"],
-            persona_narrative=persona["persona_narrative"],
-        )
-        pruned_history = _prune_context(chat_history)
-
-        ai_response = await speech_graph.generate_async(
-            signal=signal,
-            user_text=display_text,
-            history=pruned_history,
-            persona_block=persona_block,
-            tool_result=tool_result,
-        )
-
-        if not ai_response or len(ai_response) < 2:
-            chat_history.append({"role": "assistant", "content": "*молчит*"})
-            await save_message(session_id, "assistant", "*молчит*")
-            return
-
-        # Фоновое извлечение сущностей
-        asyncio.create_task(_extract_entities(user_text, session_id))
-
-        # ── [10] Typing delay + Отправка ────────────────
-        await _typing_delay(ai_response, chat_id)
-        await message.answer(ai_response)
-        logger.info(f"💬 [ОТВЕТ] {ai_response}\n")
-
-        chat_history.append({"role": "assistant", "content": ai_response})
-        chat_history = _prune_context(chat_history)
-        await save_message(session_id, "assistant", ai_response) # [V10.2] await
         
-        asyncio.create_task(
-            save_to_memory_async("assistant", ai_response, user_id=session_id,
-                                  extra_meta={"emotion": signal.emotion_id})
+        # Render debug terminal logs
+        print(output.debug_log)
+        
+        # Dashboard async logging
+        append_dashboard_log({
+            "timestamp": datetime.now().isoformat(),
+            "user_id": user_id,
+            "user_text": user_text,
+            "rin_emotion": output.emotion_id,
+            "rin_attitude": output.rin_attitude,
+            "response_tactic": output.tactic_id,
+            "tool_called": output.tool_name
+        })
+
+        # Check for Silence Tactic
+        if not output.should_speak:
+            logger.info("🗣️ [SPEECH] Tactic 'игнорирование' activated. Rin is silent.")
+            return
+
+        # ── 6. Tool / Function Dispatching ───────────────────
+        tool_result_str = ""
+        if output.needs_tool:
+            logger.info(f"🔧 [TOOL CALL] Requesting tool execution: {output.tool_name} with arguments {output.tool_args}")
+            # Dynamically pass user context variables if required
+            args = output.tool_args or {}
+            if output.tool_name in ["search_core_memory", "save_fact_to_memory"]:
+                args["user_id"] = user_id
+                
+            tool_res = await execute_tool(output.tool_name, args)
+            tool_result_str = f"\n[Фактическая справка от системы по вызову {output.tool_name}]: {tool_res}"
+            logger.info(f"🔧 [TOOL CALL] Done. Result: {tool_res[:80]}...")
+
+        # ── 7. Generate Speech Generation Prompt ──────────────
+        speech_prompt = _build_persona_block(
+            warmth=session["warmth"],
+            base_attitude=output.rin_attitude,
+            user_name=user_name,
+            core_memory=session["core_memory"],
+            persona_narrative=session["persona_narrative"]
         )
+        
+        # Construct dynamic logit steering bias
+        logit_bias = build_generation_logit_bias(session["warmth"])
+        max_tokens = TACTIC_LENGTH.get(output.tactic_id, 40)
 
-        # ── [V10] Авто-саммаризация (Триггер теперь внутри памяти) ────
-        asyncio.create_task(_run_summarization(chat_id, session_id))
-
-    except Exception as e:
-        logger.error(f"❌ [PIPELINE] Ошибка: {e}", exc_info=True)
-
-
-async def _extract_entities(user_text: str, session_id: str) -> None:
-    """Фоновый микро-граф: вытаскивает имя/факты и обновляет Core Memory."""
-    triggers = ["меня зовут", "мне ", "я работаю", "моё хобби", "я живу", "я люблю",
-                "я не люблю", "у меня ", "я студент", "я учусь", "мой возраст"]
-    if not any(t in user_text.lower() for t in triggers):
-        return
-    try:
-        loop = asyncio.get_event_loop()
-        def _extract():
-            return client.chat.completions.create(
-                model=MODEL,
-                messages=[
-                    {"role": "system", "content": (
-                        "Извлеки факты о пользователе из сообщения. "
-                        "Выведи только JSON: {\"имя\": ..., \"возраст\": ..., \"хобби\": ..., \"работа\": ..., \"город\": ...}. "
-                        "Если в тексте НЕТ конкретной информации о юзере, верни строго пустой JSON: {}. "
-                        "КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО выдумывать имена (например, Максим) или факты, которых нет в тексте. Только JSON, без пояснений."
-                    )},
-                    {"role": "user", "content": user_text},
-                ],
-                max_tokens=80, temperature=0.1,
-            ).choices[0].message.content.strip()
-        raw = await loop.run_in_executor(None, _extract)
-        import json as _json
-        data = _json.loads(raw)
-        facts = [f"{k}: {v}" for k, v in data.items() if v and v != "null"]
-        if facts:
-            user_data = await get_user(session_id)
-            existing = user_data.get("core_memory", "")
-            new_mem = (existing + "; " + ", ".join(facts)).strip("; ")[:500]
-            await update_core_memory(session_id, new_mem)
-            logger.info(f"🧠 [ENTITY] Обновлена Core Memory: {facts}")
-    except Exception as e:
-        logger.error(f"❌ [ENTITY] Ошибка фоновой задачи: {e}", exc_info=True)
-
-
-def _prune_context(history: list) -> list:
-    """Context Pruning: убирает системные пометки [Юзер прислал...] старше 4 позиций с конца."""
-    NOISE_PREFIXES = ("[ЮЗЕР ПРИСЛАЛ", "[Юзер прислал", "[реакция:", "*молчит*")
-    result = []
-    recent_count = 0
-    for msg in reversed(history):
-        if msg["role"] == "system":
-            result.append(msg)
-            continue
-        content = msg.get("content", "")
-        if any(content.startswith(p) for p in NOISE_PREFIXES) and recent_count >= 4:
-            continue  # прунинг старых шумовых сообщений
-        result.append(msg)
-        recent_count += 1
-    return list(reversed(result))
-
-
-async def _run_summarization(chat_id: int, session_id: str) -> None:
-    """[6] Фоновая саммаризация для конкретного чата."""
-    history = get_session(chat_id)
-    try:
-        # В V10 возвращает (new_history, suggestion)
-        new_history, suggestion = await maybe_summarize_history(
-            history, client, MODEL, user_id=session_id
+        # Inject thinking context and tool results to steer final output speech
+        steered_instruction = (
+            f"{speech_prompt}\n"
+            f"<thinking>\nЭмоция: {output.emotion_id}. Тактика: {output.tactic_id}.\n"
+            f"Внутренний мотив собеседника: {output.hidden_intent}\n</thinking>\n"
+            f"Текущая реплика собеседника: \"{user_text}\""
         )
-        if new_history is not history:
-            # Если есть предложение по Core Memory — добавляем как системную пометку
-            if suggestion:
-                new_history.append({
-                    "role": "system", 
-                    "content": f"[АРХИВНОЕ НАБЛЮДЕНИЕ: {suggestion}. Ты можешь обновить Core Memory если считаешь нужным.]"
-                })
+        if tool_result_str:
+            steered_instruction += f"\n{tool_result_str}"
+
+        # ── 8. Speech Graph Completion Generation ────────────
+        response_text = await speech_graph.run_async(
+            prompt=steered_instruction,
+            logit_bias=logit_bias,
+            max_tokens=max_tokens
+        )
+        
+        # Save assistant dialogue turn to database
+        await save_message(user_id, "assistant", response_text)
+        session["history"].append({"role": "assistant", "content": response_text})
+        
+        # Async background saving of assistant response to vector store
+        asyncio.create_task(_safe_save_to_memory("assistant", response_text, user_id))
+
+        # Send response back to Telegram
+        await message.reply(response_text)
+
+        # ── 9. Warmth & Relationship Adjustments ─────────────
+        # Cold responses slowly decrease warmth, neutral keeps same, warm acts differently
+        warmth_delta = 0.0
+        if output.emotion_id in ["усталая нежность", "тихое тепло"]:
+             warmth_delta = 0.05
+        elif output.emotion_id in ["сухой сарказм", "раздражение", "тихое презрение"]:
+             warmth_delta = -0.05
+             
+        if warmth_delta != 0.0:
+            await update_user_warmth(user_id, warmth_delta)
+            session["warmth"] = max(-1.0, min(1.0, session["warmth"] + warmth_delta))
             
-            set_session(chat_id, new_history)
-            update_history_in_db(session_id, new_history)
-            logger.info(f"✅ [MEMORY] Саммаризация чата {chat_id} завершена.")
-    except Exception as e:
-        logger.error(f"❌ [MEMORY_TASK] Ошибка в фоновой задаче: {e}", exc_info=True)
+        if output.rin_attitude != session["base_attitude"]:
+            await update_user_attitude(user_id, output.rin_attitude)
+            session["base_attitude"] = output.rin_attitude
 
-
-# ── Handlers ─────────────────────────────────────────────
-
-@dp.message(Command("start"))
-async def cmd_start(message: types.Message):
-    chat_id = message.chat.id
-    set_session(chat_id, [{"role": "system", "content": IDENTITY_PROMPT}])
-    await ensure_user(str(chat_id), message.from_user.first_name or "незнакомец")
-    await message.answer(".")
-
-
-@dp.message(Command("reset"))
-async def cmd_reset(message: types.Message):
-    set_session(message.chat.id, [{"role": "system", "content": IDENTITY_PROMPT}])
-    await message.answer("—")
-
-
-@dp.message(Command("whoami"))
-async def cmd_whoami(message: types.Message):
-    """Отладка: показывает досье юзера."""
-    p = await get_user(str(message.chat.id))
-    await message.answer(
-        f"имя={p['name']} | отношение={p['base_attitude']} | warmth={p['warmth']:.2f}"
-    )
-
-
-@dp.message(Command("setname"))
-async def cmd_setname(message: types.Message):
-    """Сохраняет имя: /setname Артём"""
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        await message.answer("—")
-        return
-    name = parts[1].strip()[:30]
-    await set_user_name(str(message.chat.id), name)
-    await message.answer(f".")
-
-
-@dp.message(F.content_type == "voice")
-async def handle_voice(message: types.Message):
-    """[4.1] Распознавание голосового сообщения через Whisper."""
-    await bot.send_chat_action(chat_id=message.chat.id, action="typing")
-    try:
-        voice = message.voice
-        file_info = await bot.get_file(voice.file_id)
-        file_bytes = await bot.download_file(file_info.file_path)
-        audio_data = file_bytes.read() if hasattr(file_bytes, "read") else bytes(file_bytes)
-        transcribed = await _transcribe_voice(audio_data)
-        if not transcribed:
-            # Fallback: сообщаем Rin что было голосовое без текста
-            transcribed = "[не удалось расшифровать]"
-        await _process_text(message, transcribed, label="voice")
-    except Exception as e:
-        logger.error(f"❌ [VOICE] {e}", exc_info=True)
-
-
-@dp.message(F.content_type == "photo")
-async def handle_photo(message: types.Message):
-    """[4.2] Реакция на фото — fallback текст."""
-    caption = message.caption or ""
-    if caption:
-        fallback = f"[Юзер прислал фотографию с подписью: \"{caption[:100]}\"]"
-    else:
-        fallback = "[Юзер прислал фотографию]"
-    await _process_text(message, fallback, label="photo")
-
-
-@dp.message(Command("idle"))
-async def handle_idle_cmd(message: types.Message):
-    """Принудительный запуск фонового графа мышления (IdleGraph)."""
-    chat_id = message.chat.id
-    session_id = str(chat_id)
-    persona = await get_user(session_id)
-    think_logs = await get_recent_think_logs(session_id, limit=50)
-    chat_history = await load_history(session_id, system_prompt="", limit=30)
-
-    await message.answer("🔄 Запускаю фоновое осмысление отношений...")
-
-    result = await idle_graph.run_async(
-        user_name=persona["name"],
-        current_attitude=persona["base_attitude"],
-        think_logs=think_logs,
-        warmth=persona["warmth"],
-        chat_history=chat_history,
-    )
-
-    if result["attitude"] != persona["base_attitude"]:
-        await update_user_attitude(session_id, result["attitude"])
-    if result.get("narrative"):
-        await update_persona_narrative(session_id, result["narrative"])
-
-    report = (
-        f"🧠 **IdleGraph Report**\n\n"
-        f"Текущее отношение: {result['attitude']}\n"
-        f"Мысли:\n{result['reasoning']}\n\n"
-        f"Нарратив:\n{result.get('narrative', 'нет изменений')}\n"
-    )
-    if result.get("initiative_text"):
-        report += f"\nИнициатива: «{result['initiative_text']}»"
-
-    await message.answer(report)
-
-
-@dp.message(F.text)
-async def handle_message(message: types.Message):
-    """Основной handler текстовых сообщений."""
-    text = message.text or ""
-    if not text.strip():
-        return
-    await _process_text(message, text)
-
-
-# ── [3.1–3.3] IdleGraph — фоновый цикл «снов» ───────────
-IDLE_CHECK_INTERVAL = 4 * 3600  # каждые 4 часа
-IDLE_INACTIVITY_MIN = 2 * 3600  # чат должен молчать хотя бы 2 часа
-
-
-async def _idle_loop() -> None:
-    """[V10] Фоновый цикл: анализ «снов» + очистка ОЗУ (Memory Cleanup)."""
-    await asyncio.sleep(IDLE_CHECK_INTERVAL)
-    while True:
-        for chat_id, _ in list(active_sessions.items()):
-            session_id = str(chat_id)
-            last_msg   = await get_last_message_time(session_id)
-
-            if last_msg is None:
-                continue
-            
-            delta = datetime.now() - last_msg
-            idle_sec = delta.total_seconds()
-            
-            # [V10] Устранение утечки памяти: выгрузка старых сессий из ОЗУ (> 24ч)
-            if idle_sec > 86400:
-                if chat_id in active_sessions:
-                    del active_sessions[chat_id]
-                    logger.info(f"♻️ [MEMORY_CLEANUP] Сессия {chat_id} выгружена из ОЗУ.")
-                continue
-
-            if idle_sec < IDLE_INACTIVITY_MIN:
-                continue  # чат ещё активен — не трогаем
-
-            persona    = await get_user(session_id)
-            think_logs = await get_recent_think_logs(session_id, limit=50)
-            chat_history = await load_history(session_id, system_prompt="", limit=30)
-
-            logger.info(f"🌙 [IDLE] Запускаем IdleGraph для {chat_id} ({persona['name']})")
-
-            # [3.1, 3.2] Запускаем граф сна
-            result = await idle_graph.run_async(
-                user_name=persona["name"],
-                current_attitude=persona["base_attitude"],
-                think_logs=think_logs,
-                warmth=persona["warmth"],
-                chat_history=chat_history,
-            )
-            logger.info(f"🌙 [IDLE] Результат: {result['reasoning']}")
-
-            # [3.2] Перезаписываем base_attitude
-            if result["attitude"] != persona["base_attitude"]:
-                await update_user_attitude(session_id, result["attitude"])
-
-            # [3.2] Сохраняем нарратив отношений
-            if result.get("narrative"):
-                await update_persona_narrative(session_id, result["narrative"])
-
-            # [3.3] Осознанная инициатива — только если IdleGraph придумал фразу
-            initiative = result.get("initiative_text")
-            if initiative:
-                try:
-                    await bot.send_message(chat_id=chat_id, text=initiative)
-                    logger.info(f"📤 [INITIATIVE] → {chat_id}: «{initiative}»")
-                    session = await get_session(chat_id)
-                    session.append({"role": "assistant", "content": initiative})
-                    await save_message(session_id, "assistant", initiative)
-                except Exception as e:
-                    logger.warning(f"⚠️  [INITIATIVE] {e}")
-
-        await asyncio.sleep(IDLE_CHECK_INTERVAL)
-
-
-# ── Запуск ───────────────────────────────────────────────
+# ════════════════════════════════════════════════════════
+#  Main Startup Thread
+# ════════════════════════════════════════════════════════
 
 async def main():
     init_db()
     
-    # [V10.1] Инициализация динамического токенизатора для корректного Logit Bias
-    # Используем репозиторий базовой модели из настроек
+    # Initialize tokenizer dynamic compiler
     init_speech_engine(TOKENIZER_MODEL)
 
     print("━" * 58)
-    print("  🌸  Rin V10 — запущена")
+    print("  🌸  Rin V10 — launched successfully")
     print("━" * 58)
-    print(f"  🧠  Think Engine  : V10 (Pydantic + Native Tools)")
-    print(f"  🧩  Векторная память: {'✅ ChromaDB V10' if is_memory_available() else '⚠️  недоступна'}")
-    print(f"  💾  SQLite        : ✅")
-    print(f"  🤖  Модель        : {MODEL}")
-    print("━" * 58 + "\n")
-
-    asyncio.create_task(_idle_loop())
+    
+    # Start cleaner loop task and bot polling
+    asyncio.create_task(_session_cleaner_loop())
     await dp.start_polling(bot)
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
+if __name__ == '__main__':
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Bot stopped.")
