@@ -143,7 +143,7 @@ try:
     import discord
     from discord.ext import commands
     DISCORD_AVAILABLE = True
-except ImportError:
+except (ImportError, ModuleNotFoundError):
     DISCORD_AVAILABLE = False
     class Dummy:
         def __init__(self, *args, **kwargs): pass
