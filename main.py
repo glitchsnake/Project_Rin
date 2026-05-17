@@ -1,75 +1,51 @@
-"""
-main.py — Telegram bot Rin (V10.3)
-
-Key Features:
-  - 100% Async / Non-blocking architecture.
-  - Periodic RAM leak protection (removes active sessions inactive for >24h).
-  - Dynamic speech compilation vocabulary steering using HuggingFace tokenizers.
-  - Non-blocking SQLite persistence queries via aiosqlite and async vector memory checks.
-"""
-
-import asyncio
-import logging
 import os
-import random
+import re
+import uuid
+import logging
+import asyncio
 import tempfile
-from dotenv import load_dotenv
-
-load_dotenv()
+import random
 from datetime import datetime, timedelta
 from typing import Optional
 
-from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, FSInputFile
 from openai import OpenAI
+from dotenv import load_dotenv
 
-from semantic_cache import get_semantic_cache_async, save_semantic_cache_async
-from semantic_router_engine import route_message_async
+load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger("main")
+
+# AI and Tokenizer settings
+AI_BACKEND_URL = os.getenv("AI_BACKEND_URL", "http://127.0.0.1:1234/v1")
+AI_API_KEY     = os.getenv("AI_API_KEY", "lm-studio")
+MODEL          = os.getenv("AI_MODEL", "rin")  # fine-tuned model
+TOKENIZER_MODEL = os.getenv("TOKENIZER_MODEL", "NousResearch/Hermes-3-Llama-3.1-8B")
+
+# Initialize OpenAI client
+client = OpenAI(base_url=AI_BACKEND_URL, api_key=AI_API_KEY)
 
 # Core modules imports
 from database import (
-    init_db,
-    ensure_user,
-    get_user,
-    update_user_warmth,
-    update_user_attitude,
-    update_core_memory,
-    update_persona_narrative,
-    save_message,
-    load_history,
-    touch_message_time,
-    get_last_message_time,
+    init_db, ensure_user, get_user, update_user_warmth,
+    update_user_attitude, update_core_memory, update_persona_narrative,
+    save_message, load_history, touch_message_time, get_last_message_time,
     append_dashboard_log
 )
 from think_engine import ThinkGraph, IdleGraph, ThinkSignal, _build_persona_block
 from memory import save_to_memory_async, recall_memories_async, summarize_if_needed
 from speech_engine import (
-    init_speech_engine,
-    build_generation_logit_bias,
-    _clean_output,
-    TACTIC_LENGTH
+    init_speech_engine, build_generation_logit_bias, _clean_output, TACTIC_LENGTH
 )
 from skills import execute_tool
+from semantic_cache import get_semantic_cache_async, save_semantic_cache_async
+from semantic_router_engine import route_message_async
 
-# Setup logging
-logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("main")
-
-# ── Configurations ────────────────────────────────────────
-API_TOKEN      = os.getenv("TELEGRAM_BOT_TOKEN")
-AI_BACKEND_URL = os.getenv("AI_BACKEND_URL", "http://127.0.0.1:1234/v1")
-AI_API_KEY     = os.getenv("AI_API_KEY", "lm-studio")
-MODEL          = os.getenv("AI_MODEL", "rin")  # fine-tuned model name
-TOKENIZER_MODEL = os.getenv("TOKENIZER_MODEL", "NousResearch/Hermes-3-Llama-3.1-8B")
-
-if not API_TOKEN:
-    logger.critical("❌ [CRITICAL] TELEGRAM_BOT_TOKEN is not set in environment or .env file!")
-    raise ValueError("TELEGRAM_BOT_TOKEN is missing!")
-
-bot         = Bot(token=API_TOKEN)
-dp          = Dispatcher()
-client      = OpenAI(base_url=AI_BACKEND_URL, api_key=AI_API_KEY)
+# AI Engine setup
 think_graph  = ThinkGraph(client=client, model=MODEL)
 idle_graph   = IdleGraph(client=client, model=MODEL)
 
@@ -77,228 +53,147 @@ idle_graph   = IdleGraph(client=client, model=MODEL)
 active_sessions = {}
 session_locks = {}
 
-# ════════════════════════════════════════════════════════
-#  RAM Protection: Periodic Session Pruning
-# ════════════════════════════════════════════════════════
+# ── [Rate Limiter] ───────────────────────────────────────
+_user_message_times: dict[int, list[datetime]] = {}
+RATE_LIMIT_SECONDS = 3.0
 
-async def _session_cleaner_loop():
-    """Runs a periodic loop to clean up active_sessions to prevent RAM memory leaks."""
-    while True:
-        try:
-            await asyncio.sleep(3600)  # check every hour
-            now = datetime.now()
-            expired_keys = []
-            
-            for key, session in list(active_sessions.items()):
-                last_active = session.get("last_active_time", now)
-                # Keep active sessions in RAM for max 24 hours of inactivity
-                if now - last_active > timedelta(hours=24):
-                    expired_keys.append(key)
-                    
-            for key in expired_keys:
-                if key in active_sessions:
-                    del active_sessions[key]
-                    logger.info(f"🧹 [RAM CLEANER] Session {key} purged due to 24h inactivity.")
-        except Exception as e:
-            logger.error(f"❌ [RAM CLEANER] Error in cleaner loop: {e}")
-
-# ════════════════════════════════════════════════════════
-#  Speech Graph (Async V10)
-# ════════════════════════════════════════════════════════
-
-class SpeechGraph:
-    def __init__(self, client: OpenAI, model: str):
-        self.client = client
-        self.model = model
-
-    def run(self, prompt: str, logit_bias: dict, max_tokens: int) -> str:
-        """Runs the OpenAI text completion using dynamic logit steering constraints."""
-        try:
-            completion = self.client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "system", "content": prompt}],
-                temperature=0.7,
-                max_tokens=max_tokens,
-                logit_bias=logit_bias
-            )
-            raw = completion.choices[0].message.content
-            return _clean_output(raw)
-        except Exception as e:
-            logger.error(f"❌ [SPEECH] Speech generation failure: {e}")
-            return "..."
-
-    async def run_async(self, *args, **kwargs) -> str:
-        return await asyncio.get_event_loop().run_in_executor(
-            None, lambda: self.run(*args, **kwargs)
-        )
-
-speech_graph = SpeechGraph(client=client, model=MODEL)
-
-# ════════════════════════════════════════════════════════
-#  Background Task Runners (Safe Error Handling)
-# ════════════════════════════════════════════════════════
-
-async def _safe_run_summarization(history: list[dict], user_id: str):
-    """Executes long-term memory summarization in a safe background task."""
-    try:
-        updated_history, summary_output = await summarize_if_needed(history, user_id, client, MODEL)
-        
-        # Inject core memory suggestions back into the active sessions cycle
-        if summary_output and summary_output.summary:
-            if user_id in active_sessions:
-                active_sessions[user_id]["history"] = updated_history
-                
-                # Signal to the agent to dynamically update its Core Memory profile
-                if summary_output.core_memory_update:
-                    observation_msg = (
-                        f"[ARCHIVE OBSERVATION]: Dialogue analysis revealed new facts. "
-                        f"Suggested Core Memory update: '{summary_output.core_memory_update}'. "
-                        f"You can call update_core_memory tool to save this if it is important."
-                    )
-                    active_sessions[user_id]["history"].append({"role": "system", "content": observation_msg})
-                    logger.info(f"💡 [MEMORY] Suggestion injected for user {user_id}: {summary_output.core_memory_update}")
-    except Exception as e:
-         logger.error(f"❌ [BACKGROUND TASK] Summarization failed: {e}", exc_info=True)
-
-
-async def _safe_save_to_memory(role: str, content: str, user_id: str):
-    """Saves conversation turns to vector store in a background task."""
-    try:
-        await save_to_memory_async(role, content, user_id)
-    except Exception as e:
-         logger.error(f"❌ [BACKGROUND TASK] Save memory failed: {e}", exc_info=True)
-
-# ════════════════════════════════════════════════════════
-#  Voice Processing (STT Async ThreadPoolExecutor)
-# ════════════════════════════════════════════════════════
-
-async def _transcribe_voice(file_path: str) -> Optional[str]:
-    """Sends voice message file to OpenAI whisper API asynchronously."""
-    def worker():
-        try:
-            with open(file_path, "rb") as audio:
-                transcript = client.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=audio
-                )
-                return transcript.text
-        except Exception as e:
-            logger.error(f"❌ [STT] Transcription error: {e}")
-            return None
-            
-    return await asyncio.get_event_loop().run_in_executor(None, worker)
-
-_user_message_times: dict[str, list[datetime]] = {}
-
-def _check_rate_limit(chat_id: str, limit: int = 1, duration: float = 3.0) -> bool:
-    """Sliding-window rate limiter using RAM token buckets to defend against spam."""
+def _check_rate_limit(chat_id: int) -> bool:
+    """Limits the request frequency (no more than 1 request per 3 seconds per channel/DM)."""
     now = datetime.now()
-    if chat_id not in _user_message_times:
-        _user_message_times[chat_id] = [now]
-        return True
+    if chat_id in _user_message_times:
+        times = _user_message_times[chat_id]
+        times = [t for t in times if now - t < timedelta(seconds=RATE_LIMIT_SECONDS)]
+        _user_message_times[chat_id] = times
+        if len(times) >= 1:
+            return False
+    else:
+        _user_message_times[chat_id] = []
     
-    # Filter out records older than duration
-    cutoff = now - timedelta(seconds=duration)
-    _user_message_times[chat_id] = [t for t in _user_message_times[chat_id] if t > cutoff]
-    
-    # Garbage collect other inactive chat ids periodically (size > 1000)
-    if len(_user_message_times) > 1000:
-        inactive = [cid for cid, times in _user_message_times.items() if not times or times[-1] < cutoff]
-        for cid in inactive:
-            _user_message_times.pop(cid, None)
-            
-    if len(_user_message_times[chat_id]) >= limit:
-        return False
-        
     _user_message_times[chat_id].append(now)
     return True
 
 
-# ════════════════════════════════════════════════════════
-#  Core Orchestration Loop: Message Handlers
-# ════════════════════════════════════════════════════════
+# ── [4.1] Whisper STT (Async) ────────────────────────────
+async def _transcribe_voice(file_bytes: bytes) -> str:
+    """Transcribes audio file using Whisper STT via OpenAI-compatible endpoint."""
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
 
-@dp.message(F.content_type.in_({"text", "voice"}))
-async def handle_any_message(message: Message):
-    user_id   = str(message.from_user.id)
-    user_name = message.from_user.first_name or "Friend"
-    
-    # Sliding window rate limiter (max 1 message per 3 seconds per user)
-    if not _check_rate_limit(user_id):
-        logger.warning(f"⚠️ [RATE LIMIT] User {user_id} dropped: spam detected.")
-        return
-    
-    # Initialize lock for this user to prevent race conditions in fast double clicks
-    if user_id not in session_locks:
-        session_locks[user_id] = asyncio.Lock()
+        loop = asyncio.get_event_loop()
+        def _whisper():
+            with open(tmp_path, "rb") as audio_file:
+                return client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=audio_file,
+                    language="en",
+                )
         
-    async with session_locks[user_id]:
-        await ensure_user(user_id, user_name)
+        result = await loop.run_in_executor(None, _whisper)
         
-        # Load active session parameters from RAM or SQLite
-        if user_id not in active_sessions:
-            logger.info(f"⏳ [SESSION] Loading session {user_id} into RAM cache...")
-            db_user = await get_user(user_id)
+        try:
+            os.unlink(tmp_path)
+        except:
+            pass
             
-            # Formulate the initial dynamic persona block
-            system_prompt = _build_persona_block(
-                warmth=db_user["warmth"],
-                base_attitude=db_user["base_attitude"],
-                user_name=db_user["name"],
-                core_memory=db_user["core_memory"],
-                persona_narrative=db_user["persona_narrative"]
+        return result.text.strip()
+    except Exception as e:
+        logger.error(f"❌ [WHISPER] Failed to transcribe voice: {e}")
+        return ""
+
+
+# ── [TTS] Speech Generation (for voice channels) ──────────
+async def _generate_speech(text: str) -> Optional[bytes]:
+    """Generates speech audio bytes using OpenAI-compatible TTS API."""
+    try:
+        loop = asyncio.get_event_loop()
+        def _tts():
+            response = client.audio.speech.create(
+                model="tts-1",
+                voice="alloy",
+                input=text
             )
-            
-            history = await load_history(user_id, system_prompt=system_prompt, limit=15)
-            active_sessions[user_id] = {
-                "history": history,
-                "warmth": db_user["warmth"],
-                "base_attitude": db_user["base_attitude"],
-                "core_memory": db_user["core_memory"],
-                "persona_narrative": db_user["persona_narrative"],
-                "last_active_time": datetime.now()
-            }
-        else:
-            active_sessions[user_id]["last_active_time"] = datetime.now()
-            
-        session = active_sessions[user_id]
-        
-        # ── 1. Load User Message ──────────────────────────
-        user_text = ""
-        voice_temp_path = None
-        
-        if message.text:
-            user_text = message.text
-        elif message.voice:
-            # Voice loading
-            try:
-                voice = message.voice
-                # Create secure temporary file
-                fd, voice_temp_path = tempfile.mkstemp(suffix=".ogg")
-                os.close(fd)
-                
-                await bot.download(voice, destination=voice_temp_path)
-                logger.info(f"🎙️ [STT] Audio file downloaded: {voice_temp_path}")
-                
-                user_text = await _transcribe_voice(voice_temp_path)
-                if not user_text:
-                    await message.reply("I couldn't understand the voice...")
-                    return
-                logger.info(f"🎙️ [STT] Result: \"{user_text}\"")
-            except Exception as e:
-                logger.error(f"❌ [VOICE] Failed to process voice: {e}")
-                await message.reply("I was unable to listen to your voice recording.")
-                return
-            finally:
-                if voice_temp_path and os.path.exists(voice_temp_path):
-                    try:
-                        os.remove(voice_temp_path)
-                    except:
-                        pass
+            return response.content
+        return await loop.run_in_executor(None, _tts)
+    except Exception as e:
+        logger.error(f"❌ [TTS] Speech generation failed: {e}")
+        return None
 
-        if not user_text.strip():
-             return
 
+# ── Try Reaction on Message ──────────────────────────────
+async def _try_reaction(message, emoji: str) -> bool:
+    try:
+        await message.add_reaction(emoji)
+        return True
+    except Exception as e:
+        logger.warning(f"⚠️ [REACTION] Could not add reaction: {e}")
+        return False
+
+
+# Simulated typing delay
+async def _typing_delay(text: str, channel) -> None:
+    word_count = len(text.split())
+    delay = min(max(word_count * 0.12, 0.5), 2.5)
+    await asyncio.sleep(delay)
+
+
+# ── Discord Import with Sandbox Safe Fallback ───────────
+try:
+    import discord
+    from discord.ext import commands
+    DISCORD_AVAILABLE = True
+except ImportError:
+    DISCORD_AVAILABLE = False
+    class Dummy:
+        def __init__(self, *args, **kwargs): pass
+        def __getattr__(self, name): return Dummy
+    discord = Dummy()
+    discord.Intents = Dummy()
+    discord.Intents.default = lambda: Dummy()
+    commands = Dummy()
+    commands.Bot = Dummy
+
+
+# ── [Central Text Pipeline] ──────────────────────────────
+async def _process_text(message, user_text: str, label: str = "") -> None:
+    """Core text processing pipeline."""
+    if isinstance(message.channel, discord.DMChannel):
+        session_id = f"dm_{message.author.id}"
+        chat_id = message.author.id
+    else:
+        session_id = f"channel_{message.channel.id}"
+        chat_id = message.channel.id
+
+    if not _check_rate_limit(chat_id):
+        logger.warning(f"⚠️ [RATE LIMIT] Rate limit triggered for {chat_id}")
+        return
+
+    # Ensure user exists in database
+    username = message.author.global_name or message.author.name or "stranger"
+    await ensure_user(session_id, username)
+    await touch_message_time(session_id)
+
+    # Load session and lock
+    if session_id not in active_sessions:
+        db_user = await get_user(session_id)
+        history = await load_history(session_id, system_prompt="", limit=20)
+        active_sessions[session_id] = {
+            "history": history,
+            "warmth": db_user["warmth"],
+            "base_attitude": db_user["base_attitude"],
+            "core_memory": db_user["core_memory"],
+            "persona_narrative": db_user["persona_narrative"],
+            "last_active_time": datetime.now()
+        }
+    
+    session = active_sessions[session_id]
+    session["last_active_time"] = datetime.now()
+
+    if session_id not in session_locks:
+        session_locks[session_id] = asyncio.Lock()
+
+    async with session_locks[session_id]:
         # ── [Semantic Cache Check] ──────────────────────────
         warmth = session["warmth"]
         attitude = session["base_attitude"]
@@ -311,152 +206,181 @@ async def handle_any_message(message: Message):
 
         cached_response = await get_semantic_cache_async(user_text, attitude, warmth_tier)
         if cached_response:
-            await bot.send_chat_action(chat_id=message.chat.id, action="typing")
-            
-            # Simulated delay
-            word_count = len(cached_response.split())
-            delay = min(max(word_count * 0.12, 0.5), 2.5)
-            await asyncio.sleep(delay)
+            async with message.channel.typing():
+                await _typing_delay(cached_response, message.channel)
             
             await message.reply(cached_response)
             logger.info(f"⚡ [SEMANTIC CACHE] Response served from cache: {cached_response}")
             
-            # Save to database and RAM history cache
-            await save_message(user_id, "user", user_text)
+            # Speak in voice channel if connected
+            if getattr(message.guild, "voice_client", None):
+                asyncio.create_task(_speak_in_voice_channel(message.guild, cached_response))
+            
+            # Save to database and history cache
+            await save_message(session_id, "user", user_text)
             session["history"].append({"role": "user", "content": user_text})
             
-            await save_message(user_id, "assistant", cached_response)
+            await save_message(session_id, "assistant", cached_response)
             session["history"].append({"role": "assistant", "content": cached_response})
             
-            # Background tasks
-            asyncio.create_task(_safe_save_to_memory("user", user_text, user_id))
-            asyncio.create_task(_safe_save_to_memory("assistant", cached_response, user_id))
+            asyncio.create_task(save_to_memory_async("user", user_text, session_id))
+            asyncio.create_task(save_to_memory_async("assistant", cached_response, session_id))
             return
-
-        # Save user dialogue turn to database
-        await save_message(user_id, "user", user_text)
-        session["history"].append({"role": "user", "content": user_text})
-        
-        # Async background saving of message to vector store
-        asyncio.create_task(_safe_save_to_memory("user", user_text, user_id))
-        
-        # ── 2. Run Memory Summarization check (Background Task) ────
-        asyncio.create_task(_safe_run_summarization(session["history"], user_id))
-        
-        # ── 3. Recall Semantically Relevant memories from ChromaDB ─
-        memories = await recall_memories_async(user_text, user_id=user_id, n_results=3)
-
-        # ── 4. Retrieve Time passed parameters ───────────────
-        last_time = await get_last_message_time(user_id)
-        await touch_message_time(user_id)
-        
-        time_passed_str = ""
-        if last_time:
-            delta = datetime.now() - last_time
-            hours = delta.total_seconds() / 3600
-            time_passed_str = f"Time since last interaction: {hours:.2f} hours."
-            
-        current_time_str = f"Current date and time: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
 
         # ── [Semantic Routing] ──────────────────────────────
         route = await route_message_async(user_text)
-        
-        output: ThinkSignal = None
-        if route == "general":
-            logger.info("🧭 [SEMANTIC ROUTER] Routed to 'general' (bypassing System 2 reasoning for optimization)")
-            output = ThinkSignal(
-                should_speak=True,
-                needs_tool=False,
-                tool_name=None,
-                tool_args={},
-                rin_emotion="neutral",
-                rin_attitude="neutral",
-                debug_log="[🧭 SEMANTIC ROUTER] Routed to 'general'. Bypassing System 2 reasoning."
-            )
-        else:
-            # ── 5. System 2: Thinking Graph Cycle ────────────────
-            logger.info(f"🧠 [ORCHESTRATOR] running Cognitive Thinking Graph for {user_name}...")
-            
-            output: ThinkSignal = await think_graph.run_async(
-                user_text=user_text,
-                warmth=session["warmth"],
-                user_role="creator" if user_name == "Loki" else "stranger",
-                user_name=user_name,
-                base_attitude=session["base_attitude"],
-            memories_summary=memories,
-            time_passed_str=time_passed_str,
-            current_time_str=current_time_str,
-            history=session["history"]
-        )
-        
-        # Render debug terminal logs
-        print(output.debug_log)
-        
-        # Dashboard async logging
-        append_dashboard_log({
-            "timestamp": datetime.now().isoformat(),
-            "user_id": user_id,
-            "user_text": user_text,
-            "rin_emotion": output.emotion_id,
-            "rin_attitude": output.rin_attitude,
-            "response_tactic": output.tactic_id,
-            "tool_called": output.tool_name
-        })
+        logger.info(f"🛣️ [ROUTER] Message classified into: {route}")
 
-        # Check for Silence Tactic
-        if not output.should_speak:
-            logger.info("🗣️ [SPEECH] Tactic 'ignoring' activated. Rin is silent.")
+        if route == "general":
+            logger.info("⚡ [ROUTER] Fast-path routing triggered. Bypassing ThinkGraph.")
+            
+            # Inject fast-path user text
+            session["history"].append({"role": "user", "content": user_text})
+            await save_message(session_id, "user", user_text)
+            
+            persona_block = _build_persona_block(
+                warmth=session["warmth"],
+                base_attitude=session["base_attitude"],
+                user_name=username,
+                core_memory=session["core_memory"],
+                persona_narrative=session["persona_narrative"]
+            )
+            
+            steered_instruction = (
+                f"Compile response as Rin.\n"
+                f"{persona_block}\n"
+                f"Respond naturally, matching the personality constraints."
+            )
+            
+            # Logit bias & tokenizer
+            logit_bias = build_generation_logit_bias(session["base_attitude"])
+            
+            async with message.channel.typing():
+                # Direct speech generation
+                from speech_engine import SpeechGraph
+                speech_graph = SpeechGraph(client=client, model=MODEL)
+                response_text = await speech_graph.run_async(
+                    prompt=steered_instruction,
+                    logit_bias=logit_bias,
+                    max_tokens=150
+                )
+                
+                if not response_text or len(response_text) < 2:
+                    response_text = "*remains silent*"
+                    
+                await _typing_delay(response_text, message.channel)
+                await message.reply(response_text)
+                logger.info(f"💬 [RESPONSE (FAST)] {response_text}\n")
+
+            await save_message(session_id, "assistant", response_text)
+            session["history"].append({"role": "assistant", "content": response_text})
+            
+            if getattr(message.guild, "voice_client", None):
+                asyncio.create_task(_speak_in_voice_channel(message.guild, response_text))
+                
+            asyncio.create_task(save_to_memory_async("user", user_text, session_id))
+            asyncio.create_task(save_to_memory_async("assistant", response_text, session_id))
+            asyncio.create_task(save_semantic_cache_async(user_text, response_text, attitude, warmth_tier))
             return
 
-        # ── 6. Tool / Function Dispatching ───────────────────
-        tool_result_str = ""
-        if output.needs_tool:
-            logger.info(f"🔧 [TOOL CALL] Requesting tool execution: {output.tool_name} with arguments {output.tool_args}")
-            # Dynamically pass user context variables if required
-            args = output.tool_args or {}
-            if output.tool_name in ["search_core_memory", "save_fact_to_memory"]:
-                args["user_id"] = user_id
-                
-            tool_res = await execute_tool(output.tool_name, args)
-            tool_result_str = f"\n[Factual system context from tool {output.tool_name}]: {tool_res}"
-            logger.info(f"🔧 [TOOL CALL] Done. Result: {tool_res[:80]}...")
+        # ── 1. Context Injection & Log Retrieval ─────────────
+        memories_summary = await recall_memories_async(user_text, session_id, n_results=3)
+        recent_think_logs = await get_recent_think_logs(session_id, limit=6)
 
-        # ── 7. Generate Speech Generation Prompt ──────────────
-        speech_prompt = _build_persona_block(
-            warmth=session["warmth"],
-            base_attitude=output.rin_attitude,
-            user_name=user_name,
-            core_memory=session["core_memory"],
-            persona_narrative=session["persona_narrative"]
+        # ── 2. Think Graph System 2 Reasoning ────────────────
+        state = ThinkState(
+            user_text=user_text,
+            memories_summary=memories_summary,
+            current_user_name=username,
+            user_role="stranger",  # default
+            base_attitude=session["base_attitude"],
+            time_passed_str="1m",
+            current_time_str=datetime.now().strftime("%H:%M"),
+            recent_think_logs=recent_think_logs
         )
-        
-        # Construct dynamic logit steering bias
-        logit_bias = build_generation_logit_bias(session["warmth"])
-        max_tokens = TACTIC_LENGTH.get(output.tactic_id, 40)
 
-        # Inject thinking context and tool results to steer final output speech
-        steered_instruction = (
-            f"{speech_prompt}\n"
-            f"<thinking>\nEmotion: {output.emotion_id}. Tactic: {output.tactic_id}.\n"
-            f"Hidden intent of companion: {output.hidden_intent}\n</thinking>\n"
-            f"Current message of companion: <user_message>{user_text}</user_message>"
-        )
-        if tool_result_str:
-            steered_instruction += f"\n{tool_result_str}"
+        async with message.channel.typing():
+            output: ThinkSignal = await think_graph.run_async(state)
+            
+            logger.info(f"🧠 [THOUGHT] Emotion: {output.emotion_id}")
+            logger.info(f"🧠 [THOUGHT] Tactic : {output.tactic_id}")
+            logger.info(f"🧠 [THOUGHT] Attitude: {output.attitude_id}")
 
-        # ── 8. Speech Graph Completion Generation ────────────
-        response_text = await speech_graph.run_async(
-            prompt=steered_instruction,
-            logit_bias=logit_bias,
-            max_tokens=max_tokens
-        )
-        
-        # Save assistant dialogue turn to database
-        await save_message(user_id, "assistant", response_text)
+            # Append user message turn
+            session["history"].append({"role": "user", "content": user_text})
+            await save_message(session_id, "user", user_text)
+
+            # Speak check
+            if not output.should_speak:
+                logger.info("🤫 Rin decided to remain silent.")
+                await save_message(session_id, "assistant", "*remains silent*")
+                session["history"].append({"role": "assistant", "content": "*remains silent*"})
+                await message.reply("*remains silent*")
+                return
+
+            # Emoji reaction chance
+            if len(user_text.strip()) < 4 and random.random() < 0.25:
+                emoji = "😐"
+                if await _try_reaction(message, emoji):
+                    session["history"].append({"role": "assistant", "content": f"[reaction: {emoji}]"})
+                    await save_message(session_id, "assistant", f"[reaction: {emoji}]")
+                    return
+
+            # Tool Execution
+            tool_result_str = ""
+            if output.needs_tool and output.tool_name:
+                tool_args = dict(output.tool_args)
+                if output.tool_name in ("search_core_memory", "save_fact_to_memory"):
+                    tool_args.setdefault("user_id", session_id)
+                tool_result_str = await execute_tool(output.tool_name, tool_args)
+
+            # ── 7. Speech Orchestrator Logit Steering ─────────────
+            logit_bias = build_generation_logit_bias(session["base_attitude"])
+            max_tokens = min(output.tactic_id.get("max_length", 150), 300) if isinstance(output.tactic_id, dict) else 150
+
+            persona_block = _build_persona_block(
+                warmth=session["warmth"],
+                base_attitude=session["base_attitude"],
+                user_name=username,
+                core_memory=session["core_memory"],
+                persona_narrative=session["persona_narrative"]
+            )
+
+            steered_instruction = (
+                f"Compile response as Rin.\n"
+                f"{persona_block}\n"
+                f"<thinking>\nEmotion: {output.emotion_id}. Tactic: {output.tactic_id}.\n"
+                f"Hidden intent of companion: {output.hidden_intent}\n</thinking>\n"
+                f"Current message of companion: <user_message>{user_text}</user_message>"
+            )
+            if tool_result_str:
+                steered_instruction += f"\n{tool_result_str}"
+
+            # ── 8. Speech Graph Generation ────────────────────────
+            from speech_engine import SpeechGraph
+            speech_graph = SpeechGraph(client=client, model=MODEL)
+            response_text = await speech_graph.run_async(
+                prompt=steered_instruction,
+                logit_bias=logit_bias,
+                max_tokens=max_tokens
+            )
+
+            if not response_text or len(response_text) < 2:
+                response_text = "*remains silent*"
+
+            await _typing_delay(response_text, message.channel)
+            await message.reply(response_text)
+            logger.info(f"💬 [RESPONSE] {response_text}\n")
+
+        # Save turns
+        await save_message(session_id, "assistant", response_text)
         session["history"].append({"role": "assistant", "content": response_text})
         
-        # Async background saving of assistant response to vector store
-        asyncio.create_task(_safe_save_to_memory("assistant", response_text, user_id))
+        # Play in voice channel
+        if getattr(message.guild, "voice_client", None):
+            asyncio.create_task(_speak_in_voice_channel(message.guild, response_text))
+
+        asyncio.create_task(save_to_memory_async("assistant", response_text, session_id))
 
         # Save to semantic cache
         final_warmth = session["warmth"]
@@ -469,46 +393,270 @@ async def handle_any_message(message: Message):
             final_warmth_tier = "warm"
         asyncio.create_task(save_semantic_cache_async(user_text, response_text, final_attitude, final_warmth_tier))
 
-        # Send response back to Telegram
-        await message.reply(response_text)
-
         # ── 9. Warmth & Relationship Adjustments ─────────────
-        # Cold responses slowly decrease warmth, neutral keeps same, warm acts differently
         warmth_delta = 0.0
         if output.emotion_id in ["tired tenderness", "quiet warmth"]:
-             warmth_delta = 0.05
-        elif output.emotion_id in ["dry sarcasm", "irritation", "quiet contempt"]:
-             warmth_delta = -0.05
-             
+            warmth_delta = +0.15
+        elif output.emotion_id in ["guarded coldness", "silent irritation"]:
+            warmth_delta = -0.15
+
         if warmth_delta != 0.0:
-            await update_user_warmth(user_id, warmth_delta)
-            session["warmth"] = max(-1.0, min(1.0, session["warmth"] + warmth_delta))
+            new_warmth = await update_user_warmth(session_id, warmth_delta)
+            session["warmth"] = new_warmth
+            logger.info(f"📈 [WARMTH] Updated warmth for {session_id}: {new_warmth:+.2f}")
+
+        # ── 10. Memory Summarization & Pruning ────────────────
+        asyncio.create_task(_run_summarization(session_id))
+
+
+async def _run_summarization(session_id: str) -> None:
+    """Asynchronous background memory summarization trigger."""
+    try:
+        session = active_sessions[session_id]
+        pruned_history, summary_result = await summarize_if_needed(
+            history=session["history"],
+            user_id=session_id,
+            client=client,
+            model=MODEL
+        )
+        
+        if pruned_history is not session["history"]:
+            session["history"] = pruned_history
+            await update_history_in_db(session_id, pruned_history)
             
-        if output.rin_attitude != session["base_attitude"]:
-            await update_user_attitude(user_id, output.rin_attitude)
-            session["base_attitude"] = output.rin_attitude
+            if summary_result:
+                if getattr(summary_result, "core_memory_update", None):
+                    await update_core_memory(session_id, summary_result.core_memory_update)
+                    session["core_memory"] = summary_result.core_memory_update
+                    
+                await append_dashboard_log(
+                    session_id,
+                    f"Summarization completed. Core memory updated: {bool(summary_result.core_memory_update)}"
+                )
+    except Exception as e:
+        logger.error(f"❌ [SUMMARY] In background execution: {e}")
 
-# ════════════════════════════════════════════════════════
-#  Main Startup Thread
-# ════════════════════════════════════════════════════════
 
+# ── [TTS] Voice Playing ───────────────────────────────
+async def _speak_in_voice_channel(guild, text: str):
+    """Speaks output text inside active guild voice channel."""
+    if not DISCORD_AVAILABLE or not guild.voice_client:
+        return
+    
+    audio_bytes = await _generate_speech(text)
+    if not audio_bytes:
+        return
+        
+    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+        tmp.write(audio_bytes)
+        tmp_path = tmp.name
+        
+    try:
+        vc = guild.voice_client
+        if vc.is_playing():
+            vc.stop()
+            
+        vc.play(
+            discord.FFmpegPCMAudio(tmp_path), 
+            after=lambda e: os.unlink(tmp_path)
+        )
+    except Exception as e:
+        logger.error(f"❌ [VOICE_PLAY] Failed to play speech audio: {e}")
+        try:
+            os.unlink(tmp_path)
+        except:
+            pass
+
+
+# ── Discord Bot Setup ─────────────────────────────────
+if DISCORD_AVAILABLE:
+    intents = discord.Intents.default()
+    intents.message_content = True
+    intents.voice_states = True
+    intents.guilds = True
+    intents.members = True
+
+    bot = commands.Bot(command_prefix="!", intents=intents)
+
+    @bot.event
+    async def on_ready():
+        logger.info(f"🌸 Bot {bot.user.name} successfully connected to Discord!")
+
+    @bot.command(name="start")
+    async def cmd_start(ctx):
+        session_id = f"dm_{ctx.author.id}" if isinstance(ctx.channel, discord.DMChannel) else f"channel_{ctx.channel.id}"
+        await ensure_user(session_id, ctx.author.global_name or ctx.author.name)
+        await ctx.reply("...")
+
+    @bot.command(name="reset")
+    async def cmd_reset(ctx):
+        session_id = f"dm_{ctx.author.id}" if isinstance(ctx.channel, discord.DMChannel) else f"channel_{ctx.channel.id}"
+        if session_id in active_sessions:
+            del active_sessions[session_id]
+        await ctx.reply("—")
+
+    @bot.command(name="whoami")
+    async def cmd_whoami(ctx):
+        session_id = f"dm_{ctx.author.id}" if isinstance(ctx.channel, discord.DMChannel) else f"channel_{ctx.channel.id}"
+        p = await get_user(session_id)
+        await ctx.reply(
+            f"name={p['name']} | attitude={p['base_attitude']} | warmth={p['warmth']:.2f}"
+        )
+
+    @bot.command(name="join")
+    async def cmd_join(ctx):
+        """Joins user's current voice channel."""
+        if not ctx.author.voice:
+            await ctx.reply("You must be in a voice channel!")
+            return
+        
+        channel = ctx.author.voice.channel
+        if ctx.voice_client:
+            await ctx.voice_client.move_to(channel)
+        else:
+            await channel.connect()
+        await ctx.reply("👋 Connected to your voice channel.")
+
+    @bot.command(name="leave")
+    async def cmd_leave(ctx):
+        """Disconnects from active voice channel."""
+        if ctx.voice_client:
+            await ctx.voice_client.disconnect()
+            await ctx.reply("🚪 Left voice channel.")
+        else:
+            await ctx.reply("I am not in a voice channel.")
+
+    @bot.event
+    async def on_message(message: discord.Message):
+        if message.author == bot.user:
+            return
+
+        await bot.process_commands(message)
+
+        if message.content.startswith("!"):
+            return
+
+        user_text = message.content or ""
+        
+        # Audio attachments check (voice messages)
+        voice_data = None
+        for attachment in message.attachments:
+            if attachment.filename.lower().endswith(('.ogg', '.mp3', '.wav', '.m4a', '.mp4', '.3gp')):
+                async with message.channel.typing():
+                    audio_bytes = await attachment.read()
+                    voice_data = audio_bytes
+                    logger.info(f"🎙️ [VOICE] Detected audio attachment: {attachment.filename}")
+                    break
+
+        if voice_data:
+            transcribed = await _transcribe_voice(voice_data)
+            if not transcribed:
+                transcribed = "[failed to transcribe voice]"
+            await _process_text(message, transcribed, label="voice")
+        elif user_text.strip():
+            await _process_text(message, user_text)
+
+
+# ── IdleGraph Sleep Loop & RAM Pruning ─────────────────
+async def _idle_loop():
+    """Runs a periodic loop to clean up RAM memory leaks + run IdleGraph dreams."""
+    while True:
+        try:
+            await asyncio.sleep(3600)  # check every hour
+            now = datetime.now()
+            expired_keys = []
+            
+            # RAM Pruning
+            for key, session in list(active_sessions.items()):
+                last_active = session.get("last_active_time", now)
+                if now - last_active > timedelta(hours=24):
+                    expired_keys.append(key)
+                    
+            for key in expired_keys:
+                if key in active_sessions:
+                    del active_sessions[key]
+                    logger.info(f"♻️ [MEMORY_CLEANUP] Evicted inactive session {key} from RAM cache.")
+
+            # IdleGraph analysis cycle (every 4 hours of inactivity)
+            for session_id, session in list(active_sessions.items()):
+                last_msg = await get_last_message_time(session_id)
+                if last_msg is None:
+                    continue
+                
+                delta = now - last_msg
+                if delta.total_seconds() > 14400:  # 4 hours
+                    logger.info(f"🌙 [IDLE] Activating IdleGraph dreams for {session_id}")
+                    
+                    persona = await get_user(session_id)
+                    think_logs = await get_recent_think_logs(session_id, limit=50)
+                    chat_history = await load_history(session_id, system_prompt="", limit=30)
+
+                    result = await idle_graph.run_async(
+                        user_name=persona["name"],
+                        current_attitude=persona["base_attitude"],
+                        think_logs=think_logs,
+                        warmth=persona["warmth"],
+                        chat_history=chat_history
+                    )
+
+                    if result.get("attitude") and result["attitude"] != persona["base_attitude"]:
+                        await update_user_attitude(session_id, result["attitude"])
+                        
+                    if result.get("narrative"):
+                        await update_persona_narrative(session_id, result["narrative"])
+
+                    # Direct proactive output
+                    initiative = result.get("initiative_text")
+                    if initiative and DISCORD_AVAILABLE:
+                        try:
+                            target_id = int(session_id.split("_")[1])
+                            if session_id.startswith("dm_"):
+                                user = await bot.fetch_user(target_id)
+                                await user.send(initiative)
+                            else:
+                                channel = await bot.fetch_channel(target_id)
+                                await channel.send(initiative)
+                            
+                            logger.info(f"📤 [INITIATIVE] → {session_id}: «{initiative}»")
+                            session["history"].append({"role": "assistant", "content": initiative})
+                            await save_message(session_id, "assistant", initiative)
+                        except Exception as e:
+                            logger.warning(f"⚠️ [INITIATIVE] Proactive send failed: {e}")
+
+        except Exception as e:
+            logger.error(f"❌ [IDLE_LOOP] In background dream cycle: {e}")
+
+
+# ── Main Entrypoint ────────────────────────────────────
 async def main():
     init_db()
-    
-    # Initialize tokenizer dynamic compiler
     init_speech_engine(TOKENIZER_MODEL)
 
     print("━" * 58)
-    print("  🌸  Rin V10 — launched successfully")
+    print("  🌸  Rin V10 Discord Bot (English) — Online")
     print("━" * 58)
+    print(f"  🧠  Think Engine  : V10 (Pydantic + Native Tools)")
+    print(f"  🧩  Vector Memory : {'✅ ChromaDB V10' if is_memory_available() else '⚠️  Unavailable'}")
+    print(f"  💾  SQLite        : ✅")
+    print(f"  🤖  Model         : {MODEL}")
+    print("━" * 58 + "\n")
+
+    asyncio.create_task(_idle_loop())
     
-    # Start cleaner loop task and bot polling
-    asyncio.create_task(_session_cleaner_loop())
-    await dp.start_polling(bot)
+    if DISCORD_AVAILABLE:
+        token = os.getenv("DISCORD_BOT_TOKEN")
+        if not token:
+            logger.critical("❌ [CRITICAL] DISCORD_BOT_TOKEN is missing!")
+            return
+        await bot.start(token)
+    else:
+        logger.warning("⚠️  [START] Running in simulation mode (discord.py is offline).")
+        while True:
+            await asyncio.sleep(3600)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Bot stopped.")
+    except KeyboardInterrupt:
+        logger.info("👋 Shutting down Rin.")

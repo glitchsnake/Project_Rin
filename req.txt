@@ -1,8 +1,9 @@
 # Rin V9 — зависимости
 # pip install -r req.txt
 
-# Telegram
-aiogram==3.*
+# Discord
+discord.py==2.3.2
+PyNaCl==1.5.0
 
 # OpenAI-совместимый клиент (LM Studio)
 openai>=1.0.0
