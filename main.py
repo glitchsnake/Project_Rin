@@ -185,6 +185,32 @@ async def _transcribe_voice(file_path: str) -> Optional[str]:
             
     return await asyncio.get_event_loop().run_in_executor(None, worker)
 
+_user_message_times: dict[str, list[datetime]] = {}
+
+def _check_rate_limit(chat_id: str, limit: int = 1, duration: float = 3.0) -> bool:
+    """Sliding-window rate limiter using RAM token buckets to defend against spam."""
+    now = datetime.now()
+    if chat_id not in _user_message_times:
+        _user_message_times[chat_id] = [now]
+        return True
+    
+    # Filter out records older than duration
+    cutoff = now - timedelta(seconds=duration)
+    _user_message_times[chat_id] = [t for t in _user_message_times[chat_id] if t > cutoff]
+    
+    # Garbage collect other inactive chat ids periodically (size > 1000)
+    if len(_user_message_times) > 1000:
+        inactive = [cid for cid, times in _user_message_times.items() if not times or times[-1] < cutoff]
+        for cid in inactive:
+            _user_message_times.pop(cid, None)
+            
+    if len(_user_message_times[chat_id]) >= limit:
+        return False
+        
+    _user_message_times[chat_id].append(now)
+    return True
+
+
 # ════════════════════════════════════════════════════════
 #  Core Orchestration Loop: Message Handlers
 # ════════════════════════════════════════════════════════
@@ -193,6 +219,11 @@ async def _transcribe_voice(file_path: str) -> Optional[str]:
 async def handle_any_message(message: Message):
     user_id   = str(message.from_user.id)
     user_name = message.from_user.first_name or "Friend"
+    
+    # Sliding window rate limiter (max 1 message per 3 seconds per user)
+    if not _check_rate_limit(user_id):
+        logger.warning(f"⚠️ [RATE LIMIT] User {user_id} dropped: spam detected.")
+        return
     
     # Initialize lock for this user to prevent race conditions in fast double clicks
     if user_id not in session_locks:
@@ -355,7 +386,7 @@ async def handle_any_message(message: Message):
             f"{speech_prompt}\n"
             f"<thinking>\nEmotion: {output.emotion_id}. Tactic: {output.tactic_id}.\n"
             f"Hidden intent of companion: {output.hidden_intent}\n</thinking>\n"
-            f"Current message of companion: \"{user_text}\""
+            f"Current message of companion: <user_message>{user_text}</user_message>"
         )
         if tool_result_str:
             steered_instruction += f"\n{tool_result_str}"

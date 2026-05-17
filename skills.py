@@ -66,10 +66,37 @@ async def search_wikipedia(query: str = "") -> str:
         return f"[Wikipedia Error: {e}]"
 
 
+_DOCKER_AVAILABLE = None
+
+async def is_docker_available() -> bool:
+    """Fast check of Docker daemon availability with caching and 1.5s timeout."""
+    global _DOCKER_AVAILABLE
+    if _DOCKER_AVAILABLE is not None:
+        return _DOCKER_AVAILABLE
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "docker", "version",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL
+        )
+        try:
+            await asyncio.wait_for(proc.communicate(), timeout=1.5)
+            _DOCKER_AVAILABLE = (proc.returncode == 0)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except:
+                pass
+            _DOCKER_AVAILABLE = False
+    except Exception:
+        _DOCKER_AVAILABLE = False
+    return _DOCKER_AVAILABLE
+
+
 async def execute_python(code: str) -> str:
     """
     Executes Python calculation in an isolated secure sandbox (V2) asynchronously.
-    Uses create_subprocess_exec to prevent blocking the Main Thread loop.
+    Uses containerized Docker sandbox with graceful fallback to local subprocess.
     """
     # Expanded Security Blacklist (protects local host from exploitation)
     BLOCKED = [
@@ -81,8 +108,40 @@ async def execute_python(code: str) -> str:
         if b in code:
             return f"[SECURITY BLOCKED] Unsafe module/function usage: {b}"
             
+    # 1. Ephemeral non-networked Docker Container Sandbox
+    if await is_docker_available():
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "docker", "run", "--rm", "--network", "none", "--cpus", "0.5", "-m", "50m", "python:3.10-alpine", "python", "-c", code,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            try:
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+                
+                # Exit code 125 means daemon connection/start failed
+                if proc.returncode == 125:
+                    raise RuntimeError("Docker daemon error (exit code 125)")
+                    
+                output = stdout.decode().strip()
+                error  = stderr.decode().strip()
+                
+                if error:
+                    return f"[Python Error]: {error[:300]}"
+                return output[:500] if output else "[Code executed successfully, no stdout]"
+                
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                except:
+                    pass
+                return "[Python Error: Execution timeout limit exceeded (5.0s)]"
+                
+        except Exception as docker_err:
+            logger.warning(f"⚠️ [SKILLS] Docker sandbox unavailable ({docker_err}). Falling back to local subprocess...")
+            
+    # 2. Graceful Fallback: Local Subprocess Sandbox
     try:
-        # Launch async subprocess execution
         proc = await asyncio.create_subprocess_exec(
             sys.executable, "-c", code,
             stdout=asyncio.subprocess.PIPE,
@@ -90,7 +149,6 @@ async def execute_python(code: str) -> str:
         )
         
         try:
-            # Wait for execution with strict 5.0 seconds timeout
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
             
             output = stdout.decode().strip()

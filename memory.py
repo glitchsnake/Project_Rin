@@ -123,10 +123,42 @@ def save_to_memory(role: str, content: str, user_id: str, extra_meta: Optional[d
     Performs cosine similarity deduplication to prevent vector garbage.
     If similarity > 0.92, increments frequency instead of adding a new document.
     """
-    if not is_memory_available() or not _is_important(role, content):
+    if not is_memory_available():
+        return
+        
+    # Clamp text size to protect vector index from giant malicious bloating
+    content = content[:1000]
+    
+    if not _is_important(role, content):
         return
         
     try:
+        # Storage Quota: limit to 500 documents per user (FIFO eviction)
+        try:
+            user_docs = _collection.get(where={"user_id": user_id}, include=["metadatas"])
+            if user_docs and user_docs["ids"] and len(user_docs["ids"]) >= 500:
+                oldest_id = None
+                oldest_time = None
+                for doc_id, meta in zip(user_docs["ids"], user_docs["metadatas"]):
+                    ts_str = meta.get("created_timestamp") or meta.get("last_seen_timestamp")
+                    if ts_str:
+                        try:
+                            ts = datetime.fromisoformat(ts_str)
+                            if oldest_time is None or ts < oldest_time:
+                                oldest_time = ts
+                                oldest_id = doc_id
+                        except Exception:
+                            oldest_id = doc_id
+                            break
+                    else:
+                        oldest_id = doc_id
+                        break
+                if oldest_id:
+                    _collection.delete(ids=[oldest_id])
+                    logger.info(f"🗑️ [MEMORY] Quota limit exceeded (500) for {user_id}. Pruned oldest record: {oldest_id}")
+        except Exception as quota_err:
+            logger.warning(f"⚠️ [MEMORY] Failed to enforce storage quota: {quota_err}")
+
         # Precompute text embeddings
         emb = _embedder.encode(content).tolist()
         now_str = datetime.now().isoformat()
