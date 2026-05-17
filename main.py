@@ -462,6 +462,31 @@ async def _speak_in_voice_channel(guild, text: str):
             pass
 
 
+# ── Проверка соединения с ИИ-бэкендом ──────────────────────
+async def _check_ai_connection():
+    """Тестирует связь с OpenAI-совместимым API LM Studio."""
+    logger.info(f"🧠 [AI CONNECTION] Проверка связи с AI бэкендом: {AI_BACKEND_URL} ...")
+    try:
+        loop = asyncio.get_event_loop()
+        def _call():
+            return client.models.list()
+        
+        models = await asyncio.wait_for(loop.run_in_executor(None, _call), timeout=5.0)
+        available_models = [m.id for m in models.data]
+        logger.info(f"✅ [AI CONNECTION] Подключение успешно! Доступные модели: {', '.join(available_models)}")
+        if MODEL in available_models:
+            logger.info(f"🎯 [AI CONNECTION] Заданная модель '{MODEL}' полностью доступна!")
+        else:
+            logger.warning(f"⚠️ [AI CONNECTION] Заданная модель '{MODEL}' отсутствует в списке. Бэкенд будет использовать модель по умолчанию.")
+        return True
+    except asyncio.TimeoutError:
+        logger.error(f"❌ [AI CONNECTION] Превышено время ожидания ответа от бэкенда {AI_BACKEND_URL} (таймаут 5 сек)!")
+        return False
+    except Exception as e:
+        logger.error(f"❌ [AI CONNECTION] Ошибка соединения с AI бэкендом {AI_BACKEND_URL}: {e}")
+        return False
+
+
 # ── Настройка Discord Бота (если библиотека доступна) ──────
 if DISCORD_AVAILABLE:
     intents = discord.Intents.default()
@@ -474,12 +499,18 @@ if DISCORD_AVAILABLE:
 
     @bot.event
     async def on_ready():
-        logger.info(f"🌸 Бот {bot.user.name} успешно подключился к Discord!")
+        logger.info(f"🌸 Бот {bot.user} успешно авторизован в Discord!")
+        logger.info(f"🆔 Discord ID бота: {bot.user.id}")
+        logger.info(f"🏡 Серверы бота ({len(bot.guilds)}): {', '.join([g.name for g in bot.guilds]) if bot.guilds else 'только личные сообщения (DM)'}")
+        
         try:
             await bot.change_presence(status=discord.Status.dnd)
-            logger.info("🌙 Статус бота изменен на 'Не беспокоить' (DND)")
+            logger.info("🌙 Статус присутствия успешно изменен на 'Не беспокоить' (DND)!")
         except Exception as e:
-            logger.warning(f"⚠️ Не удалось установить статус DND: {e}")
+            logger.warning(f"⚠️ Не удалось сменить статус на DND: {e}")
+
+        # Фоновая проверка связи с ИИ при запуске
+        asyncio.create_task(_check_ai_connection())
 
     # ── Команды ───────────────────────────────────────────
     @bot.command(name="start")
