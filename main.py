@@ -274,7 +274,8 @@ async def _process_text(message, user_text: str, label: str = "") -> None:
                 user_text=user_text,
                 history=chat_history,
                 persona_block=persona_block,
-                tool_result=""
+                tool_result="",
+                warmth=warmth
             )
             
             if not ai_response or len(ai_response) < 2:

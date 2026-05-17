@@ -146,21 +146,27 @@ class SpeechGraph:
 
     def generate(
         self,
-        signal:       ThinkSignal,
+        signal:       Optional[ThinkSignal],
         user_text:    str,
         history:      list[dict],
         persona_block: str = "",
         tool_result:   str = "",
+        warmth:       float = 0.0,
     ) -> str:
-        if not signal.should_speak:
-            return ""
-
-        max_tokens = TACTIC_MAX_TOKENS.get(signal.tactic_id, 60)
-        if max_tokens == 0:
-            return ""
+        if signal is not None:
+            if not signal.should_speak:
+                return ""
+            max_tokens = TACTIC_MAX_TOKENS.get(signal.tactic_id, 60)
+            if max_tokens == 0:
+                return ""
+            ex_user, ex_rin = EMOTION_EXAMPLES.get(signal.emotion_id, _DEFAULT_EXAMPLE)
+            warmth_val = signal.warmth
+        else:
+            max_tokens = 80
+            ex_user, ex_rin = _DEFAULT_EXAMPLE
+            warmth_val = warmth
 
         system = persona_block if persona_block else PERSONA_ONLY
-        ex_user, ex_rin = EMOTION_EXAMPLES.get(signal.emotion_id, _DEFAULT_EXAMPLE)
         clean_history = [m for m in history if m["role"] != "system"][-10:]
 
         messages = [{"role": "system", "content": system}]
@@ -174,9 +180,9 @@ class SpeechGraph:
         messages.append({"role": "user", "content": f"<user_message>{user_text}</user_message>"})
 
         # [V10.1] O(1) lookup
-        logit_bias = build_generation_logit_bias(signal.warmth)
+        logit_bias = build_generation_logit_bias(warmth_val)
 
-        temperature = 0.4 + signal.warmth * 0.4
+        temperature = 0.4 + warmth_val * 0.4
         temperature = max(0.3, min(0.9, temperature))
 
         try:
@@ -203,15 +209,16 @@ class SpeechGraph:
 
     async def generate_async(
         self,
-        signal:       ThinkSignal,
+        signal:       Optional[ThinkSignal],
         user_text:    str,
         history:      list[dict],
         persona_block: str = "",
         tool_result:   str = "",
+        warmth:       float = 0.0,
     ) -> str:
         loop = asyncio.get_event_loop()
         fn = functools.partial(
-            self.generate, signal, user_text, history, persona_block, tool_result
+            self.generate, signal, user_text, history, persona_block, tool_result, warmth
         )
         return await loop.run_in_executor(None, fn)
 
