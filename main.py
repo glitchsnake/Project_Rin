@@ -23,6 +23,9 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, FSInputFile
 from openai import OpenAI
 
+from semantic_cache import get_semantic_cache_async, save_semantic_cache_async
+from semantic_router_engine import route_message_async
+
 # Core modules imports
 from database import (
     init_db,
@@ -296,6 +299,31 @@ async def handle_any_message(message: Message):
         if not user_text.strip():
              return
 
+        # ── [Semantic Cache Check] ──────────────────────────
+        cached_response = await get_semantic_cache_async(user_text)
+        if cached_response:
+            await bot.send_chat_action(chat_id=message.chat.id, action="typing")
+            
+            # Simulated delay
+            word_count = len(cached_response.split())
+            delay = min(max(word_count * 0.12, 0.5), 2.5)
+            await asyncio.sleep(delay)
+            
+            await message.reply(cached_response)
+            logger.info(f"⚡ [SEMANTIC CACHE] Response served from cache: {cached_response}")
+            
+            # Save to database and RAM history cache
+            await save_message(user_id, "user", user_text)
+            session["history"].append({"role": "user", "content": user_text})
+            
+            await save_message(user_id, "assistant", cached_response)
+            session["history"].append({"role": "assistant", "content": cached_response})
+            
+            # Background tasks
+            asyncio.create_task(_safe_save_to_memory("user", user_text, user_id))
+            asyncio.create_task(_safe_save_to_memory("assistant", cached_response, user_id))
+            return
+
         # Save user dialogue turn to database
         await save_message(user_id, "user", user_text)
         session["history"].append({"role": "user", "content": user_text})
@@ -321,15 +349,31 @@ async def handle_any_message(message: Message):
             
         current_time_str = f"Current date and time: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
 
-        # ── 5. System 2: Thinking Graph Cycle ────────────────
-        logger.info(f"🧠 [ORCHESTRATOR] running Cognitive Thinking Graph for {user_name}...")
+        # ── [Semantic Routing] ──────────────────────────────
+        route = await route_message_async(user_text)
         
-        output: ThinkSignal = await think_graph.run_async(
-            user_text=user_text,
-            warmth=session["warmth"],
-            user_role="creator" if user_name == "Loki" else "stranger",
-            user_name=user_name,
-            base_attitude=session["base_attitude"],
+        output: ThinkSignal = None
+        if route == "general":
+            logger.info("🧭 [SEMANTIC ROUTER] Routed to 'general' (bypassing System 2 reasoning for optimization)")
+            output = ThinkSignal(
+                should_speak=True,
+                needs_tool=False,
+                tool_name=None,
+                tool_args={},
+                rin_emotion="neutral",
+                rin_attitude="neutral",
+                debug_log="[🧭 SEMANTIC ROUTER] Routed to 'general'. Bypassing System 2 reasoning."
+            )
+        else:
+            # ── 5. System 2: Thinking Graph Cycle ────────────────
+            logger.info(f"🧠 [ORCHESTRATOR] running Cognitive Thinking Graph for {user_name}...")
+            
+            output: ThinkSignal = await think_graph.run_async(
+                user_text=user_text,
+                warmth=session["warmth"],
+                user_role="creator" if user_name == "Loki" else "stranger",
+                user_name=user_name,
+                base_attitude=session["base_attitude"],
             memories_summary=memories,
             time_passed_str=time_passed_str,
             current_time_str=current_time_str,
@@ -404,6 +448,9 @@ async def handle_any_message(message: Message):
         
         # Async background saving of assistant response to vector store
         asyncio.create_task(_safe_save_to_memory("assistant", response_text, user_id))
+
+        # Save to semantic cache
+        asyncio.create_task(save_semantic_cache_async(user_text, response_text))
 
         # Send response back to Telegram
         await message.reply(response_text)
