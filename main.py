@@ -1,73 +1,58 @@
-"""
-main.py — Telegram-бот Rin (V9)
-
-[1.1] Session Manager: active_sessions[chat_id] — изоляция истории по чатам
-[1.2] session_id = str(chat_id) — динамическая передача в БД
-[1.3] user_id в ChromaDB — партиционирование памяти
-[1.4] User Persona: имя + base_attitude из БД
-[2.1] Silent Time Injection: время суток в системный промпт
-[2.2] Time Drift: дельта с последнего сообщения
-[3.1] IdleGraph: фоновый граф «снов» — анализ логов дня
-[3.2] Attitude Shift: перезапись base_attitude после сна
-[3.3] Осознанная инициатива от IdleGraph
-[4.1] Voice handler: Whisper STT
-[4.2] Photo handler: fallback-текст
-"""
-
-import asyncio
-import logging
 import os
-import random
+import re
+import uuid
+import logging
+import asyncio
 import tempfile
-from dotenv import load_dotenv
-
-load_dotenv()
+import random
 from datetime import datetime, timedelta
 from typing import Optional
 
-from aiogram import Bot, Dispatcher, F, types
-from aiogram.filters import Command
-from aiogram.types import ReactionTypeEmoji
 from openai import OpenAI
+from dotenv import load_dotenv
 
-from think_engine import ThinkGraph, IdleGraph, _build_persona_block, ThinkSignal
-from speech_engine import SpeechGraph, init_speech_engine
-from memory import save_to_memory_async, recall_memories_async, maybe_summarize_history, is_memory_available
-from skills import execute_tool_async
-from database import (
-    init_db, save_message, load_history, update_history_in_db, log_think_result,
-    touch_message_time, get_last_message_time,
-    ensure_user, get_user, update_user_warmth, update_user_attitude, set_user_name,
-    get_recent_think_logs, update_core_memory, update_persona_narrative,
+# Загружаем переменные окружения
+load_dotenv()
+
+# Инициализация логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[logging.StreamHandler()]
 )
-from semantic_cache import get_semantic_cache_async, save_semantic_cache_async
-from semantic_router_engine import route_message_async
-
-# ── Логирование ──────────────────────────────────────────
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-                    datefmt="%H:%M:%S")
 logger = logging.getLogger("main")
 
-# ── Настройки ────────────────────────────────────────────
-API_TOKEN      = os.getenv("TELEGRAM_BOT_TOKEN")
+# Настройки ИИ и Токенизатора
 AI_BACKEND_URL = os.getenv("AI_BACKEND_URL", "http://127.0.0.1:1234/v1")
 AI_API_KEY     = os.getenv("AI_API_KEY", "lm-studio")
 MODEL          = os.getenv("AI_MODEL", "rin")  # дообученная модель
 TOKENIZER_MODEL = os.getenv("TOKENIZER_MODEL", "NousResearch/Hermes-3-Llama-3.1-8B")
 
-if not API_TOKEN:
-    logger.critical("❌ [CRITICAL] TELEGRAM_BOT_TOKEN is not set in environment or .env file!")
-    raise ValueError("TELEGRAM_BOT_TOKEN is missing!")
+# Инициализация OpenAI-клиента
+client = OpenAI(base_url=AI_BACKEND_URL, api_key=AI_API_KEY)
 
-bot         = Bot(token=API_TOKEN)
-dp          = Dispatcher()
-client      = OpenAI(base_url=AI_BACKEND_URL, api_key=AI_API_KEY)
+# Импорты ядра Rin (импортируются лениво или напрямую)
+from database import (
+    init_db, get_user, ensure_user, save_message, load_history,
+    update_user_warmth, update_user_attitude, update_persona_narrative,
+    get_recent_think_logs, get_last_message_time, update_history_in_db
+)
+from memory import (
+    save_to_memory_async, is_memory_available, count_history_tokens,
+    maybe_summarize_history
+)
+from think_engine import ThinkGraph, IdleGraph, ThinkState
+from speech_engine import SpeechGraph, init_speech_engine
+from semantic_cache import get_semantic_cache_async, save_semantic_cache_async
+from semantic_router_engine import route_message, init_router
+from skills import execute_tool_async
+
+# Графы мышления
 think_graph  = ThinkGraph(client=client, model=MODEL)
 idle_graph   = IdleGraph(client=client, model=MODEL)
 speech_graph = SpeechGraph(client=client, model=MODEL)
 
-# ── Личность ─────────────────────────────────────────────
+# Личность Rin
 IDENTITY_PROMPT = (
     "Твое имя Rin. Тебе 20 лет. Внутри всегда ощущается легкая пустота и серость. "
     "Ты не любишь тратить слова впустую. Редко пишешь больше одного предложения. "
@@ -76,100 +61,46 @@ IDENTITY_PROMPT = (
 )
 
 # ── [1.1] Session Manager ────────────────────────────────
-# active_sessions[chat_id] = list of messages (in-memory кэш)
-active_sessions: dict[int, list] = {}
+# active_sessions[session_id] = list of messages (in-memory кэш)
+active_sessions: dict[str, list] = {}
 
-async def get_session(chat_id: int) -> list:
-    """Возвращает историю для конкретного чата (V10.2: Async)."""
-    if chat_id not in active_sessions:
-        session_id = str(chat_id)
+async def get_session(session_id: str) -> list:
+    """Возвращает историю для конкретной сессии (V10.2: Async)."""
+    if session_id not in active_sessions:
         # Загружаем без IDENTITY_PROMPT — SpeechGraph сам строит системный промпт
         history = await load_history(session_id, system_prompt="", limit=20)
         # Убираем старые system-сообщения из истории
-        active_sessions[chat_id] = [m for m in history if m["role"] != "system"]
-    return active_sessions[chat_id]
-
-def set_session(chat_id: int, history: list) -> None:
-    active_sessions[chat_id] = history
-
-# ── Реакции ──────────────────────────────────────────────
-REACTION_MAP = {
-    "тихое презрение":    ["👎", "🤡"],
-    "раздражённая скука": ["😑", "🥱"],
-    "сухой сарказм":      ["🤡", "😐"],
-}
-REACTION_THRESHOLD = 0.4
-
-INITIATIVE_MIN = 3 * 3600
-INITIATIVE_MAX = 6 * 3600
-
-# ── Хелперы ──────────────────────────────────────────────
-
-def _build_time_context() -> tuple[str, str]:
-    """[2.1] Возвращает (time_str, period) для инъекции."""
-    now  = datetime.now()
-    hour = now.hour
-    weekdays = ["понедельник","вторник","среда","четверг","пятница","суббота","воскресенье"]
-    day   = weekdays[now.weekday()]
-    if   5  <= hour < 12: period = "утро"
-    elif 12 <= hour < 17: period = "день"
-    elif 17 <= hour < 22: period = "вечер"
-    else:                  period = "ночь"
-    return f"{now.strftime('%H:%M')}, {day}, {period}", period
+        active_sessions[session_id] = [m for m in history if m["role"] != "system"]
+    return active_sessions[session_id]
 
 
-async def _build_time_drift(session_id: str) -> str:
-    """[2.2] Вычисляет дельту с последнего сообщения (V10.2: Async)."""
-    last = await get_last_message_time(session_id)
-    if last is None:
-        return ""
-    delta = datetime.now() - last
-    hours = delta.total_seconds() / 3600
-    if   hours < 1:    return ""
-    elif hours < 6:    return f"Прошло {int(hours)} ч."
-    elif hours < 24:   return f"Прошло {int(hours)} ч. (полдня)"
-    elif hours < 48:   return "Прошёл почти день."
-    elif hours < 168:  return f"Прошло {int(hours // 24)} дн."
-    else:              return f"Прошла неделя."
+def set_session(session_id: str, history: list) -> None:
+    """Устанавливает историю сессии в ОЗУ."""
+    active_sessions[session_id] = [m for m in history if m["role"] != "system"]
 
 
-async def _typing_delay(text: str, chat_id: int) -> None:
-    """[10] Умный typing — имитация реальной скорости."""
-    delay   = min(len(text) / 20, 6.0)
-    elapsed = 0.0
-    while elapsed < delay:
-        await bot.send_chat_action(chat_id=chat_id, action="typing")
-        wait     = min(4.0, delay - elapsed)
-        await asyncio.sleep(wait)
-        elapsed += wait
+# ── [Rate Limiter] ───────────────────────────────────────
+_user_message_times: dict[int, list[datetime]] = {}
+RATE_LIMIT_SECONDS = 3.0
+
+def _check_rate_limit(chat_id: int) -> bool:
+    """Ограничивает частоту запросов (не чаще 1 раза в 3 секунды для одного чата)."""
+    now = datetime.now()
+    if chat_id in _user_message_times:
+        # Очищаем старые записи
+        times = _user_message_times[chat_id]
+        times = [t for t in times if now - t < timedelta(seconds=RATE_LIMIT_SECONDS)]
+        _user_message_times[chat_id] = times
+        if len(times) >= 1:
+            return False
+    else:
+        _user_message_times[chat_id] = []
+    
+    _user_message_times[chat_id].append(now)
+    return True
 
 
-async def _try_reaction(message: types.Message, emoji: str) -> bool:
-    """[11] Ставит реакцию, возвращает успех."""
-    try:
-        await bot.set_message_reaction(
-            chat_id=message.chat.id,
-            message_id=message.message_id,
-            reaction=[ReactionTypeEmoji(emoji=emoji)],
-        )
-        logger.info(f"💢 [REACTION] {emoji}")
-        return True
-    except Exception as e:
-        logger.warning(f"⚠️  [REACTION] {e}")
-        return False
-
-
-async def _maybe_react(think, user_text: str) -> Optional[str]:
-    """[11] Нужна ли реакция вместо текста?"""
-    if think.rin_emotion in REACTION_MAP and random.random() < 0.30:
-        return random.choice(REACTION_MAP[think.rin_emotion])
-    if len(user_text.strip()) < 4 and think.confidence < REACTION_THRESHOLD:
-        if random.random() < 0.25:
-            return "😐"
-    return None
-
-
-# ── [4.1] Whisper STT ────────────────────────────────────
+# ── [4.1] Whisper STT (Async) ────────────────────────────
 async def _transcribe_voice(file_bytes: bytes) -> str:
     """Транскрибирует голосовое сообщение через Whisper (V10: Async I/O)."""
     try:
@@ -179,7 +110,6 @@ async def _transcribe_voice(file_bytes: bytes) -> str:
 
         loop = asyncio.get_event_loop()
         def _whisper():
-            # [V10] Операция открытия и чтения файла теперь внутри Executor
             with open(tmp_path, "rb") as audio_file:
                 return client.audio.transcriptions.create(
                     model="whisper-1",
@@ -189,72 +119,94 @@ async def _transcribe_voice(file_bytes: bytes) -> str:
         
         result = await loop.run_in_executor(None, _whisper)
         
-        # Удаляем временный файл после использования
         try:
-            import os
             os.unlink(tmp_path)
         except:
             pass
             
         return result.text.strip()
     except Exception as e:
-        logger.warning(f"⚠️  [WHISPER] Ошибка: {e}")
+        logger.error(f"❌ [WHISPER] Ошибка распознавания голоса: {e}")
         return ""
 
 
-# ── [Rate Limiter] ───────────────────────────────────────
-# Хранит времена последних сообщений каждого пользователя: {chat_id: [datetime]}
-_user_message_times: dict[int, list[datetime]] = {}
-RATE_LIMIT_SECONDS = 3.0  # минимум 3 секунды между запросами
+# ── [TTS] Генерация речи (для голосовых каналов) ──────────
+async def _generate_speech(text: str) -> Optional[bytes]:
+    """Генерирует аудио из текста с помощью OpenAI-совместимого TTS API."""
+    try:
+        loop = asyncio.get_event_loop()
+        def _tts():
+            response = client.audio.speech.create(
+                model="tts-1",
+                voice="alloy",
+                input=text
+            )
+            return response.content
+        return await loop.run_in_executor(None, _tts)
+    except Exception as e:
+        logger.error(f"❌ [TTS] Ошибка генерации речи: {e}")
+        return None
 
-def _check_rate_limit(chat_id: int) -> bool:
-    """Проверяет превышение лимита запросов. Возвращает True, если запрос разрешен."""
-    now = datetime.now()
-    
-    # Автоматическая чистка словаря от старых записей
-    if random.random() < 0.05:
-        limit_time = now - timedelta(hours=1)
-        for cid, t_list in list(_user_message_times.items()):
-            cleaned = [t for t in t_list if t > limit_time]
-            if not cleaned:
-                del _user_message_times[cid]
-            else:
-                _user_message_times[cid] = cleaned
 
-    if chat_id not in _user_message_times:
-        _user_message_times[chat_id] = [now]
+# ── Попытка поставить реакцию на сообщение ────────────────
+async def _try_reaction(message, emoji: str) -> bool:
+    """Пытается поставить реакцию в Discord."""
+    try:
+        await message.add_reaction(emoji)
         return True
-    
-    times = _user_message_times[chat_id]
-    times = [t for t in times if now - t < timedelta(seconds=RATE_LIMIT_SECONDS)]
-    
-    if len(times) >= 1:
+    except Exception as e:
+        logger.warning(f"⚠️ [REACTION] Не удалось добавить реакцию: {e}")
         return False
-        
-    times.append(now)
-    _user_message_times[chat_id] = times
-    return True
 
 
-# ── Основная логика обработки текста ─────────────────────
-async def _process_text(message: types.Message, user_text: str, label: str = "") -> None:
+# Имитация задержки печати/говорения
+async def _typing_delay(text: str, channel) -> None:
+    """Имитирует задержку набора ответа (зависит от длины строки)."""
+    word_count = len(text.split())
+    delay = min(max(word_count * 0.12, 0.5), 2.5)
+    await asyncio.sleep(delay)
+
+
+# ── Импорт Discord с резервным моком (для тестов в песочнице) ──
+try:
+    import discord
+    from discord.ext import commands
+    DISCORD_AVAILABLE = True
+except ImportError:
+    DISCORD_AVAILABLE = False
+    # Заглушки классов для обеспечения работы юнит-тестов без установленного discord.py
+    class Dummy:
+        def __init__(self, *args, **kwargs): pass
+        def __getattr__(self, name): return Dummy
+    discord = Dummy()
+    discord.Intents = Dummy()
+    discord.Intents.default = lambda: Dummy()
+    commands = Dummy()
+    commands.Bot = Dummy
+
+
+# ── [Центральный Пайплайн обработки текста] ────────────────
+async def _process_text(message, user_text: str, label: str = "") -> None:
     """Центральный pipeline — принимает финальный текст и прогоняет через ThinkGraph."""
-    chat_id    = message.chat.id
-    session_id = str(chat_id)
+    # Определение уникального ID сессии (личка vs серверные каналы)
+    if isinstance(message.channel, discord.DMChannel):
+        session_id = f"dm_{message.author.id}"
+        chat_id = message.author.id
+    else:
+        session_id = f"channel_{message.channel.id}"
+        chat_id = message.channel.id
 
-    # ── [Rate Limiter Check] ─────────────────────────────
+    # Проверка лимитов (Rate Limiter)
     if not _check_rate_limit(chat_id):
         logger.warning(f"⚠️ [RATE LIMIT] Запрос от {chat_id} проигнорирован (слишком часто)")
         return
 
-    # [1.4] Загружаем досье юзера
-    username = message.from_user.first_name or "незнакомец"
+    # Загружаем досье юзера
+    username = message.author.global_name or message.author.name or "незнакомец"
     await ensure_user(session_id, username)
-    await touch_message_time(session_id) # [V10.2] await
 
-    # [1.4] Досье пользователя
-    persona = await get_user(session_id) # [V10.2] await
-    chat_history = await get_session(chat_id) # [V10.2] await
+    persona = await get_user(session_id)
+    chat_history = await get_session(session_id)
 
     # ── [Семантический кэш] ──────────────────────────────
     warmth = persona.get("warmth", 0.0)
@@ -268,13 +220,16 @@ async def _process_text(message: types.Message, user_text: str, label: str = "")
 
     cached_response = await get_semantic_cache_async(user_text, attitude, warmth_tier)
     if cached_response:
-        # Имитируем набор текста
-        await bot.send_chat_action(chat_id=chat_id, action="typing")
-        await _typing_delay(cached_response, chat_id)
+        async with message.channel.typing():
+            await _typing_delay(cached_response, message.channel)
         
-        # Отвечаем
-        await message.answer(cached_response)
+        # Отвечаем в текстовом канале
+        await message.reply(cached_response)
         logger.info(f"⚡ [SEMANTIC CACHE] Ответ выдан из кэша: {cached_response}\n")
+        
+        # Если бот находится в голосовом канале на том же сервере — озвучиваем ответ!
+        if getattr(message.guild, "voice_client", None):
+            asyncio.create_task(_speak_in_voice_channel(message.guild, cached_response))
         
         # Обновляем историю и БД
         display_text = f"[ЮЗЕР ПРИСЛАЛ ГОЛОСОВОЕ: \"{user_text}\"]" if label == "voice" else user_text
@@ -289,133 +244,146 @@ async def _process_text(message: types.Message, user_text: str, label: str = "")
         asyncio.create_task(save_to_memory_async("assistant", cached_response, user_id=session_id))
         return
 
-    # Если голосовое — добавляем пометку
+    # Добавляем в историю
     display_text = f"[ЮЗЕР ПРИСЛАЛ ГОЛОСОВОЕ: \"{user_text}\"]" if label == "voice" else user_text
     chat_history.append({"role": "user", "content": display_text})
     await save_message(session_id, "user", display_text)
 
-    # [2.1] Время суток
-    current_time_str, _ = _build_time_context()
-    # [2.2] Дельта
-    time_passed_str = await _build_time_drift(session_id)
+    # Текущее время
+    current_time_str = datetime.now().strftime("%H:%M")
+    
+    # ── [Семантический роутер (Stage 1.2)] ─────────────────
+    route = route_message(user_text)
+    logger.info(f"🛣️ [ROUTER] Маршрут сообщения: {route}")
 
-    # [1.3] RAG-воспоминания с user_id
-    memories_summary = ""
-    if is_memory_available():
-        memories_summary = await recall_memories_async(user_text, user_id=session_id)
-
-    # Сохраняем в память [1.3]
-    asyncio.create_task(save_to_memory_async("user", user_text, user_id=session_id))
-
-    await bot.send_chat_action(chat_id=chat_id, action="typing")
-
-    # Рассчитываем роль юзера: если в ядре написано "создатель" — он создатель
-    user_role = "создатель" if "создатель" in persona["core_memory"].lower() else "незнакомец"
-
-    try:
-        # ── Семантическая маршрутизация ───────────────
-        route = await route_message_async(user_text)
+    # Если роут "general" (приветствие, простые фразы) — обходим тяжелый ThinkGraph!
+    if route == "general":
+        logger.info("⚡ [ROUTER] Быстрый путь: пропуск ThinkGraph.")
         
-        signal: ThinkSignal = None
-        if route == "general":
-            logger.info("🧭 [SEMANTIC ROUTER] Маршрут 'general' (пропуск System 2 мышления для оптимизации)")
-            signal = ThinkSignal(
-                should_speak=True,
-                needs_tool=False,
-                tool_name=None,
-                tool_args={},
-                rin_emotion="нейтральное",
-                rin_attitude="нейтральное",
-                debug_log="[🧭 SEMANTIC ROUTER] Маршрут 'general'. Пропуск System 2 мышления."
-            )
-        else:
-            # ── ЭТАП 1: THINK ENGINE → ThinkSignal ─────────
-            signal = await think_graph.run_async(
-                user_text=display_text,
-                chat_history=chat_history,
-                warmth=persona["warmth"],
-                memories_summary=memories_summary,
-                current_user_name=persona["name"],
-                user_role=user_role,
-                base_attitude=persona["base_attitude"],
-                time_passed_str=time_passed_str,
-                current_time_str=current_time_str,
-            )
-        print(signal.debug_log)
-
-        # [Задача 14] Логируем скрытый процесс мышления (V10.2: await)
-        await log_think_result(session_id, display_text, signal)
-
-        # [4.3] Утилитарное влияние на warmth (V10.2: await)
-        await update_user_warmth(session_id, {
-            "слегка тёплое":  +0.2, "нейтральное":  0.0,
-            "безразличное":  -0.1, "настороженное": -0.1,
-            "раздражённое": -0.2,
-        }.get(signal.rin_attitude, 0.0))
-        persona = await get_user(session_id)  # перечитываем после warmth
-
-        # ── Conditional: молчать ──────────────────────
-        if not signal.should_speak:
-            logger.info("🤫 Rin молчит.")
-            chat_history.append({"role": "assistant", "content": "*молчит*"})
-            await save_message(session_id, "assistant", "*молчит*")
-            return
-
-        # ── [11] Реакция emoji ─────────────────────
-        # Простой чек: если текст < 4 символа — шанс 25% поставить реакцию
-        if len(user_text.strip()) < 4 and random.random() < 0.25:
-            emoji = "😐"
-            if await _try_reaction(message, emoji):
-                chat_history.append({"role": "assistant", "content": f"[реакция: {emoji}]"})
-                await save_message(session_id, "assistant", f"[реакция: {emoji}]")
-                return
-
-        # ── [9] Tool Use ────────────────────────────
-        tool_result = ""
-        if signal.needs_tool and signal.tool_name:
-            args = dict(signal.tool_args)
-            if signal.tool_name in ("search_core_memory", "save_fact_to_memory"):
-                args.setdefault("user_id", session_id)
-            tool_result = await execute_tool_async(signal.tool_name, args)
-
-        # ── ЭТАП 2: SPEECH ENGINE (Branch-Solve-Merge) ────
-        persona_block = _build_persona_block(
-            warmth=persona["warmth"],
-            base_attitude=persona["base_attitude"],
-            user_name=persona["name"],
-            core_memory=persona["core_memory"],
-            persona_narrative=persona["persona_narrative"],
-        )
-        pruned_history = _prune_context(chat_history)
-
-        ai_response = await speech_graph.generate_async(
-            signal=signal,
-            user_text=display_text,
-            history=pruned_history,
-            persona_block=persona_block,
-            tool_result=tool_result,
+        # Быстрый блок личности
+        persona_block = (
+            f"Companion core state: {persona['base_attitude']}. "
+            f"Companion warmth tier: {warmth_tier}. "
+            f"Companion narrative/memory: {persona['persona_narrative'] or 'Empty'}. "
+            f"User name: {username}."
         )
 
-        if not ai_response or len(ai_response) < 2:
-            chat_history.append({"role": "assistant", "content": "*молчит*"})
-            await save_message(session_id, "assistant", "*молчит*")
-            return
-
-        # Фоновое извлечение сущностей
-        asyncio.create_task(_extract_entities(user_text, session_id))
-
-        # ── [10] Typing delay + Отправка ────────────────
-        await _typing_delay(ai_response, chat_id)
-        await message.answer(ai_response)
-        logger.info(f"💬 [ОТВЕТ] {ai_response}\n")
+        async with message.channel.typing():
+            ai_response = await speech_graph.generate_async(
+                signal=None,  # нет мета-сигнала
+                user_text=user_text,
+                history=chat_history,
+                persona_block=persona_block,
+                tool_result=""
+            )
+            
+            if not ai_response or len(ai_response) < 2:
+                ai_response = "*молчит*"
+                
+            await _typing_delay(ai_response, message.channel)
+            await message.reply(ai_response)
+            logger.info(f"💬 [ОТВЕТ (FAST)] {ai_response}\n")
 
         chat_history.append({"role": "assistant", "content": ai_response})
-        chat_history = _prune_context(chat_history)
-        await save_message(session_id, "assistant", ai_response) # [V10.2] await
+        await save_message(session_id, "assistant", ai_response)
         
+        # Озвучиваем если в голосовом канале
+        if getattr(message.guild, "voice_client", None):
+            asyncio.create_task(_speak_in_voice_channel(message.guild, ai_response))
+            
+        asyncio.create_task(save_to_memory_async("user", user_text, user_id=session_id))
+        asyncio.create_task(save_to_memory_async("assistant", ai_response, user_id=session_id))
+        asyncio.create_task(save_semantic_cache_async(user_text, ai_response, attitude, warmth_tier))
+        return
+
+    # ── ЭТАП 1: THINK ENGINE (System 2 Thinking) ───────
+    try:
+        # Извлекаем контекстные воспоминания из ChromaDB
+        memories_summary = ""
+        if is_memory_available():
+            from memory import recall_memories
+            memories_summary = recall_memories(user_text, user_id=session_id, n_results=3)
+
+        recent_think_logs = await get_recent_think_logs(session_id, limit=6)
+
+        state = ThinkState(
+            user_text=user_text,
+            memories_summary=memories_summary,
+            current_user_name=persona["name"],
+            user_role="companion",  # стандартная роль
+            base_attitude=persona["base_attitude"],
+            time_passed_str="1m",    # дефолт
+            current_time_str=current_time_str,
+            recent_think_logs=recent_think_logs,
+        )
+
+        async with message.channel.typing():
+            # Запуск размышления
+            signal = await think_graph.run_async(state)
+            
+            logger.info(f"🧠 [THOUGHT] Emotion: {signal.rin_emotion}")
+            logger.info(f"🧠 [THOUGHT] Tactic : {signal.rin_tactic}")
+            logger.info(f"🧠 [THOUGHT] Attitude: {signal.rin_attitude}")
+            logger.info(f"🧠 [THOUGHT] Plan   : {signal.internal_plan}")
+
+            # Влияние на теплоту
+            await update_user_warmth(session_id, {
+                "слегка тёплое":  +0.2, "нейтральное":  0.0,
+                "безразличное":  -0.1, "настороженное": -0.1,
+                "раздражённое": -0.2,
+            }.get(signal.rin_attitude, 0.0))
+            persona = await get_user(session_id)  # перечитываем
+
+            # Если бот решает молчать
+            if not signal.should_speak:
+                logger.info("🤫 Rin молчит.")
+                chat_history.append({"role": "assistant", "content": "*молчит*"})
+                await save_message(session_id, "assistant", "*молчит*")
+                await message.reply("*молчит*")
+                return
+
+            # Выполнение инструмента (навыка) при необходимости
+            tool_result = ""
+            if signal.needs_tool and signal.tool_name:
+                args = dict(signal.tool_args)
+                if signal.tool_name in ("search_core_memory", "save_fact_to_memory"):
+                    args.setdefault("user_id", session_id)
+                tool_result = await execute_tool_async(signal.tool_name, args)
+
+            # ЭТАП 2: SPEECH ENGINE
+            persona_block = (
+                f"Companion core state: {persona['base_attitude']}. "
+                f"Companion warmth tier: {warmth_tier}. "
+                f"Companion narrative/memory: {persona['persona_narrative'] or 'Empty'}. "
+                f"User name: {username}."
+            )
+            
+            ai_response = await speech_graph.generate_async(
+                signal=signal,
+                user_text=display_text,
+                history=chat_history,
+                persona_block=persona_block,
+                tool_result=tool_result,
+            )
+
+            if not ai_response or len(ai_response) < 2:
+                ai_response = "*молчит*"
+
+            await _typing_delay(ai_response, message.channel)
+            await message.reply(ai_response)
+            logger.info(f"💬 [ОТВЕТ] {ai_response}\n")
+
+        chat_history.append({"role": "assistant", "content": ai_response})
+        await save_message(session_id, "assistant", ai_response)
+        
+        # Озвучивание в голосовом канале
+        if getattr(message.guild, "voice_client", None):
+            asyncio.create_task(_speak_in_voice_channel(message.guild, ai_response))
+        
+        # Сохранение в векторную память
         asyncio.create_task(
             save_to_memory_async("assistant", ai_response, user_id=session_id,
-                                  extra_meta={"emotion": signal.emotion_id})
+                                  extra_meta={"emotion": signal.rin_emotion})
         )
         
         # Сохранение в семантический кэш
@@ -429,236 +397,198 @@ async def _process_text(message: types.Message, user_text: str, label: str = "")
             final_warmth_tier = "warm"
         asyncio.create_task(save_semantic_cache_async(user_text, ai_response, final_attitude, final_warmth_tier))
 
-        # ── [V10] Авто-саммаризация (Триггер теперь внутри памяти) ────
+        # Фоновая саммаризация при превышении лимита токенов
         asyncio.create_task(_run_summarization(chat_id, session_id))
 
     except Exception as e:
         logger.error(f"❌ [PIPELINE] Ошибка: {e}", exc_info=True)
 
 
-async def _extract_entities(user_text: str, session_id: str) -> None:
-    """Фоновый микро-граф: вытаскивает имя/факты и обновляет Core Memory."""
-    triggers = ["меня зовут", "мне ", "я работаю", "моё хобби", "я живу", "я люблю",
-                "я не люблю", "у меня ", "я студент", "я учусь", "мой возраст"]
-    if not any(t in user_text.lower() for t in triggers):
-        return
-    try:
-        loop = asyncio.get_event_loop()
-        def _extract():
-            return client.chat.completions.create(
-                model=MODEL,
-                messages=[
-                    {"role": "system", "content": (
-                        "Извлеки факты о пользователе из сообщения. "
-                        "Выведи только JSON: {\"имя\": ..., \"возраст\": ..., \"хобби\": ..., \"работа\": ..., \"город\": ...}. "
-                        "Если в тексте НЕТ конкретной информации о юзере, верни строго пустой JSON: {}. "
-                        "КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО выдумывать имена (например, Максим) или факты, которых нет в тексте. Только JSON, без пояснений."
-                    )},
-                    {"role": "user", "content": user_text},
-                ],
-                max_tokens=80, temperature=0.1,
-            ).choices[0].message.content.strip()
-        raw = await loop.run_in_executor(None, _extract)
-        import json as _json
-        data = _json.loads(raw)
-        facts = [f"{k}: {v}" for k, v in data.items() if v and v != "null"]
-        if facts:
-            user_data = await get_user(session_id)
-            existing = user_data.get("core_memory", "")
-            new_mem = (existing + "; " + ", ".join(facts)).strip("; ")[:500]
-            await update_core_memory(session_id, new_mem)
-            logger.info(f"🧠 [ENTITY] Обновлена Core Memory: {facts}")
-    except Exception as e:
-        logger.error(f"❌ [ENTITY] Ошибка фоновой задачи: {e}", exc_info=True)
-
-
-def _prune_context(history: list) -> list:
-    """Context Pruning: убирает системные пометки [Юзер прислал...] старше 4 позиций с конца."""
-    NOISE_PREFIXES = ("[ЮЗЕР ПРИСЛАЛ", "[Юзер прислал", "[реакция:", "*молчит*")
-    result = []
-    recent_count = 0
-    for msg in reversed(history):
-        if msg["role"] == "system":
-            result.append(msg)
-            continue
-        content = msg.get("content", "")
-        if any(content.startswith(p) for p in NOISE_PREFIXES) and recent_count >= 4:
-            continue  # прунинг старых шумовых сообщений
-        result.append(msg)
-        recent_count += 1
-    return list(reversed(result))
-
-
 async def _run_summarization(chat_id: int, session_id: str) -> None:
-    """[6] Фоновая саммаризация для конкретного чата."""
-    history = get_session(chat_id)
+    """Фоновая саммаризация по токенам (V10)."""
     try:
-        # В V10 возвращает (new_history, suggestion)
+        history = await get_session(session_id)
+        # maybe_summarize_history проверяет лимиты внутри
         new_history, suggestion = await maybe_summarize_history(
-            history, client, MODEL, user_id=session_id
+            chat_history=history,
+            client=client,
+            model=MODEL,
+            user_id=session_id
         )
+        
         if new_history is not history:
-            # Если есть предложение по Core Memory — добавляем как системную пометку
             if suggestion:
                 new_history.append({
                     "role": "system", 
                     "content": f"[АРХИВНОЕ НАБЛЮДЕНИЕ: {suggestion}. Ты можешь обновить Core Memory если считаешь нужным.]"
                 })
             
-            set_session(chat_id, new_history)
-            update_history_in_db(session_id, new_history)
-            logger.info(f"✅ [MEMORY] Саммаризация чата {chat_id} завершена.")
+            set_session(session_id, new_history)
+            await update_history_in_db(session_id, new_history)
+            logger.info(f"✅ [MEMORY] Саммаризация сессии {session_id} завершена.")
     except Exception as e:
-        logger.error(f"❌ [MEMORY_TASK] Ошибка в фоновой задаче: {e}", exc_info=True)
+        logger.error(f"❌ [MEMORY_TASK] Ошибка в фоновой задаче саммаризации: {e}", exc_info=True)
 
 
-# ── Handlers ─────────────────────────────────────────────
-
-@dp.message(Command("start"))
-async def cmd_start(message: types.Message):
-    chat_id = message.chat.id
-    set_session(chat_id, [{"role": "system", "content": IDENTITY_PROMPT}])
-    await ensure_user(str(chat_id), message.from_user.first_name or "незнакомец")
-    await message.answer(".")
-
-
-@dp.message(Command("reset"))
-async def cmd_reset(message: types.Message):
-    set_session(message.chat.id, [{"role": "system", "content": IDENTITY_PROMPT}])
-    await message.answer("—")
-
-
-@dp.message(Command("whoami"))
-async def cmd_whoami(message: types.Message):
-    """Отладка: показывает досье юзера."""
-    p = await get_user(str(message.chat.id))
-    await message.answer(
-        f"имя={p['name']} | отношение={p['base_attitude']} | warmth={p['warmth']:.2f}"
-    )
-
-
-@dp.message(Command("setname"))
-async def cmd_setname(message: types.Message):
-    """Сохраняет имя: /setname Артём"""
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        await message.answer("—")
+# ── [TTS] Воспроизведение речи в голосовом канале ──────────
+async def _speak_in_voice_channel(guild, text: str):
+    """Генерирует речь и воспроизводит ее в голосовом канале сервера."""
+    if not DISCORD_AVAILABLE or not guild.voice_client:
         return
-    name = parts[1].strip()[:30]
-    await set_user_name(str(message.chat.id), name)
-    await message.answer(f".")
-
-
-@dp.message(F.content_type == "voice")
-async def handle_voice(message: types.Message):
-    """[4.1] Распознавание голосового сообщения через Whisper."""
-    await bot.send_chat_action(chat_id=message.chat.id, action="typing")
+    
+    audio_bytes = await _generate_speech(text)
+    if not audio_bytes:
+        return
+        
+    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+        tmp.write(audio_bytes)
+        tmp_path = tmp.name
+        
     try:
-        voice = message.voice
-        file_info = await bot.get_file(voice.file_id)
-        file_bytes = await bot.download_file(file_info.file_path)
-        audio_data = file_bytes.read() if hasattr(file_bytes, "read") else bytes(file_bytes)
-        transcribed = await _transcribe_voice(audio_data)
-        if not transcribed:
-            # Fallback: сообщаем Rin что было голосовое без текста
-            transcribed = "[не удалось расшифровать]"
-        await _process_text(message, transcribed, label="voice")
+        vc = guild.voice_client
+        if vc.is_playing():
+            vc.stop()
+            
+        # Воспроизведение MP3 файла с помощью FFmpeg
+        vc.play(
+            discord.FFmpegPCMAudio(tmp_path), 
+            after=lambda e: os.unlink(tmp_path)
+        )
     except Exception as e:
-        logger.error(f"❌ [VOICE] {e}", exc_info=True)
+        logger.error(f"❌ [VOICE_PLAY] Ошибка воспроизведения: {e}")
+        try:
+            os.unlink(tmp_path)
+        except:
+            pass
 
 
-@dp.message(F.content_type == "photo")
-async def handle_photo(message: types.Message):
-    """[4.2] Реакция на фото — fallback текст."""
-    caption = message.caption or ""
-    if caption:
-        fallback = f"[Юзер прислал фотографию с подписью: \"{caption[:100]}\"]"
-    else:
-        fallback = "[Юзер прислал фотографию]"
-    await _process_text(message, fallback, label="photo")
+# ── Настройка Discord Бота (если библиотека доступна) ──────
+if DISCORD_AVAILABLE:
+    intents = discord.Intents.default()
+    intents.message_content = True
+    intents.voice_states = True
+    intents.guilds = True
+    intents.members = True
 
+    bot = commands.Bot(command_prefix="!", intents=intents)
 
-@dp.message(Command("idle"))
-async def handle_idle_cmd(message: types.Message):
-    """Принудительный запуск фонового графа мышления (IdleGraph)."""
-    chat_id = message.chat.id
-    session_id = str(chat_id)
-    persona = await get_user(session_id)
-    think_logs = await get_recent_think_logs(session_id, limit=50)
-    chat_history = await load_history(session_id, system_prompt="", limit=30)
+    @bot.event
+    async def on_ready():
+        logger.info(f"🌸 Бот {bot.user.name} успешно подключился к Discord!")
 
-    await message.answer("🔄 Запускаю фоновое осмысление отношений...")
+    # ── Команды ───────────────────────────────────────────
+    @bot.command(name="start")
+    async def cmd_start(ctx):
+        session_id = f"dm_{ctx.author.id}" if isinstance(ctx.channel, discord.DMChannel) else f"channel_{ctx.channel.id}"
+        set_session(session_id, [{"role": "system", "content": IDENTITY_PROMPT}])
+        await ensure_user(session_id, ctx.author.global_name or ctx.author.name)
+        await ctx.reply("...")
 
-    result = await idle_graph.run_async(
-        user_name=persona["name"],
-        current_attitude=persona["base_attitude"],
-        think_logs=think_logs,
-        warmth=persona["warmth"],
-        chat_history=chat_history,
-    )
+    @bot.command(name="reset")
+    async def cmd_reset(ctx):
+        session_id = f"dm_{ctx.author.id}" if isinstance(ctx.channel, discord.DMChannel) else f"channel_{ctx.channel.id}"
+        set_session(session_id, [{"role": "system", "content": IDENTITY_PROMPT}])
+        await ctx.reply("—")
 
-    if result["attitude"] != persona["base_attitude"]:
-        await update_user_attitude(session_id, result["attitude"])
-    if result.get("narrative"):
-        await update_persona_narrative(session_id, result["narrative"])
+    @bot.command(name="whoami")
+    async def cmd_whoami(ctx):
+        session_id = f"dm_{ctx.author.id}" if isinstance(ctx.channel, discord.DMChannel) else f"channel_{ctx.channel.id}"
+        p = await get_user(session_id)
+        await ctx.reply(
+            f"имя={p['name']} | отношение={p['base_attitude']} | warmth={p['warmth']:.2f}"
+        )
 
-    report = (
-        f"🧠 **IdleGraph Report**\n\n"
-        f"Текущее отношение: {result['attitude']}\n"
-        f"Мысли:\n{result['reasoning']}\n\n"
-        f"Нарратив:\n{result.get('narrative', 'нет изменений')}\n"
-    )
-    if result.get("initiative_text"):
-        report += f"\nИнициатива: «{result['initiative_text']}»"
+    @bot.command(name="join")
+    async def cmd_join(ctx):
+        """Подключается к голосовому каналу пользователя."""
+        if not ctx.author.voice:
+            await ctx.reply("Ты должен находиться в голосовом канале!")
+            return
+        
+        channel = ctx.author.voice.channel
+        if ctx.voice_client:
+            await ctx.voice_client.move_to(channel)
+        else:
+            await channel.connect()
+        await ctx.reply("👋 Привет в голосовом канале.")
 
-    await message.answer(report)
+    @bot.command(name="leave")
+    async def cmd_leave(ctx):
+        """Отключается от голосового канала."""
+        if ctx.voice_client:
+            await ctx.voice_client.disconnect()
+            await ctx.reply("🚪 Вышла.")
+        else:
+            await ctx.reply("Я не нахожусь в голосовом канале.")
 
+    # ── Главный обработчик входящих событий ───────────────
+    @bot.event
+    async def on_message(message: discord.Message):
+        # Пропускаем сообщения самого бота
+        if message.author == bot.user:
+            return
 
-@dp.message(F.text)
-async def handle_message(message: types.Message):
-    """Основной handler текстовых сообщений."""
-    text = message.text or ""
-    if not text.strip():
-        return
-    await _process_text(message, text)
+        # Позволяем командам работать
+        await bot.process_commands(message)
+
+        # Если это команда (начинается с приставки) — пропускаем дальнейший анализ текста
+        if message.content.startswith("!"):
+            return
+
+        user_text = message.content or ""
+        
+        # ── [4.1] Обработка аудио вложений как голосовых сообщений ──
+        voice_data = None
+        for attachment in message.attachments:
+            if attachment.filename.lower().endswith(('.ogg', '.mp3', '.wav', '.m4a', '.mp4', '.3gp')):
+                async with message.channel.typing():
+                    # Скачиваем файл в ОЗУ
+                    audio_bytes = await attachment.read()
+                    voice_data = audio_bytes
+                    logger.info(f"🎙️ [VOICE] Обнаружен аудиофайл: {attachment.filename}")
+                    break
+
+        if voice_data:
+            transcribed = await _transcribe_voice(voice_data)
+            if not transcribed:
+                transcribed = "[не удалось расшифровать голосовое]"
+            await _process_text(message, transcribed, label="voice")
+        elif user_text.strip():
+            await _process_text(message, user_text)
 
 
 # ── [3.1–3.3] IdleGraph — фоновый цикл «снов» ───────────
 IDLE_CHECK_INTERVAL = 4 * 3600  # каждые 4 часа
 IDLE_INACTIVITY_MIN = 2 * 3600  # чат должен молчать хотя бы 2 часа
 
-
 async def _idle_loop() -> None:
-    """[V10] Фоновый цикл: анализ «снов» + очистка ОЗУ (Memory Cleanup)."""
+    """Фоновый цикл: анализ снов + очистка ОЗУ (Memory Cleanup)."""
     await asyncio.sleep(IDLE_CHECK_INTERVAL)
     while True:
-        for chat_id, _ in list(active_sessions.items()):
-            session_id = str(chat_id)
-            last_msg   = await get_last_message_time(session_id)
-
+        for session_id, _ in list(active_sessions.items()):
+            last_msg = await get_last_message_time(session_id)
             if last_msg is None:
                 continue
             
             delta = datetime.now() - last_msg
             idle_sec = delta.total_seconds()
             
-            # [V10] Устранение утечки памяти: выгрузка старых сессий из ОЗУ (> 24ч)
+            # Устранение утечки памяти: выгрузка старых сессий из ОЗУ (> 24ч)
             if idle_sec > 86400:
-                if chat_id in active_sessions:
-                    del active_sessions[chat_id]
-                    logger.info(f"♻️ [MEMORY_CLEANUP] Сессия {chat_id} выгружена из ОЗУ.")
+                if session_id in active_sessions:
+                    del active_sessions[session_id]
+                    logger.info(f"♻️ [MEMORY_CLEANUP] Сессия {session_id} выгружена из ОЗУ.")
                 continue
 
             if idle_sec < IDLE_INACTIVITY_MIN:
-                continue  # чат ещё активен — не трогаем
+                continue
 
             persona    = await get_user(session_id)
             think_logs = await get_recent_think_logs(session_id, limit=50)
             chat_history = await load_history(session_id, system_prompt="", limit=30)
 
-            logger.info(f"🌙 [IDLE] Запускаем IdleGraph для {chat_id} ({persona['name']})")
+            logger.info(f"🌙 [IDLE] Запускаем IdleGraph для {session_id} ({persona['name']})")
 
-            # [3.1, 3.2] Запускаем граф сна
             result = await idle_graph.run_async(
                 user_name=persona["name"],
                 current_attitude=persona["base_attitude"],
@@ -668,21 +598,27 @@ async def _idle_loop() -> None:
             )
             logger.info(f"🌙 [IDLE] Результат: {result['reasoning']}")
 
-            # [3.2] Перезаписываем base_attitude
             if result["attitude"] != persona["base_attitude"]:
                 await update_user_attitude(session_id, result["attitude"])
 
-            # [3.2] Сохраняем нарратив отношений
             if result.get("narrative"):
                 await update_persona_narrative(session_id, result["narrative"])
 
-            # [3.3] Осознанная инициатива — только если IdleGraph придумал фразу
+            # Осознанная инициатива (Бот пишет первым в канал/личку)
             initiative = result.get("initiative_text")
-            if initiative:
+            if initiative and DISCORD_AVAILABLE:
                 try:
-                    await bot.send_message(chat_id=chat_id, text=initiative)
-                    logger.info(f"📤 [INITIATIVE] → {chat_id}: «{initiative}»")
-                    session = await get_session(chat_id)
+                    # Извлекаем ID получателя/канала из session_id
+                    target_id = int(session_id.split("_")[1])
+                    if session_id.startswith("dm_"):
+                        user = await bot.fetch_user(target_id)
+                        await user.send(initiative)
+                    else:
+                        channel = await bot.fetch_channel(target_id)
+                        await channel.send(initiative)
+                        
+                    logger.info(f"📤 [INITIATIVE] → {session_id}: «{initiative}»")
+                    session = await get_session(session_id)
                     session.append({"role": "assistant", "content": initiative})
                     await save_message(session_id, "assistant", initiative)
                 except Exception as e:
@@ -691,17 +627,14 @@ async def _idle_loop() -> None:
         await asyncio.sleep(IDLE_CHECK_INTERVAL)
 
 
-# ── Запуск ───────────────────────────────────────────────
-
+# ── Главная точка входа ───────────────────────────────────
 async def main():
     init_db()
-    
-    # [V10.1] Инициализация динамического токенизатора для корректного Logit Bias
-    # Используем репозиторий базовой модели из настроек
     init_speech_engine(TOKENIZER_MODEL)
+    init_router()
 
     print("━" * 58)
-    print("  🌸  Rin V10 — запущена")
+    print("  🌸  Rin V10 Discord Bot — запущена")
     print("━" * 58)
     print(f"  🧠  Think Engine  : V10 (Pydantic + Native Tools)")
     print(f"  🧩  Векторная память: {'✅ ChromaDB V10' if is_memory_available() else '⚠️  недоступна'}")
@@ -709,9 +642,24 @@ async def main():
     print(f"  🤖  Модель        : {MODEL}")
     print("━" * 58 + "\n")
 
+    # Запускаем фоновый цикл снов
     asyncio.create_task(_idle_loop())
-    await dp.start_polling(bot)
+    
+    if DISCORD_AVAILABLE:
+        token = os.getenv("DISCORD_BOT_TOKEN")
+        if not token:
+            logger.critical("❌ [CRITICAL] DISCORD_BOT_TOKEN is not set in environment or .env file!")
+            return
+        await bot.start(token)
+    else:
+        logger.warning("⚠️  [START] Бот запущен в режиме тестирования (discord.py недоступен в песочнице).")
+        # Держим процесс запущенным для тестов
+        while True:
+            await asyncio.sleep(3600)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("👋 Завершение работы бота.")
