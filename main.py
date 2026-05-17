@@ -468,6 +468,31 @@ async def _speak_in_voice_channel(guild, text: str):
             pass
 
 
+# ── AI Connection Check ───────────────────────────────
+async def _check_ai_connection():
+    """Tests the connection to OpenAI-compatible AI backend."""
+    logger.info(f"🧠 [AI CONNECTION] Testing connection to AI backend: {AI_BACKEND_URL} ...")
+    try:
+        loop = asyncio.get_event_loop()
+        def _call():
+            return client.models.list()
+        
+        models = await asyncio.wait_for(loop.run_in_executor(None, _call), timeout=5.0)
+        available_models = [m.id for m in models.data]
+        logger.info(f"✅ [AI CONNECTION] Connection successful! Available models: {', '.join(available_models)}")
+        if MODEL in available_models:
+            logger.info(f"🎯 [AI CONNECTION] Target model '{MODEL}' is available!")
+        else:
+            logger.warning(f"⚠️ [AI CONNECTION] Target model '{MODEL}' was not found. Backend default model will be used.")
+        return True
+    except asyncio.TimeoutError:
+        logger.error(f"❌ [AI CONNECTION] Connection timed out for {AI_BACKEND_URL} (5s timeout)!")
+        return False
+    except Exception as e:
+        logger.error(f"❌ [AI CONNECTION] Failed to connect to AI backend {AI_BACKEND_URL}: {e}")
+        return False
+
+
 # ── Discord Bot Setup ─────────────────────────────────
 if DISCORD_AVAILABLE:
     intents = discord.Intents.default()
@@ -480,12 +505,18 @@ if DISCORD_AVAILABLE:
 
     @bot.event
     async def on_ready():
-        logger.info(f"🌸 Bot {bot.user.name} successfully connected to Discord!")
+        logger.info(f"🌸 Bot {bot.user} successfully connected to Discord!")
+        logger.info(f"🆔 Bot Discord ID: {bot.user.id}")
+        logger.info(f"🏡 Bot active guilds ({len(bot.guilds)}): {', '.join([g.name for g in bot.guilds]) if bot.guilds else 'direct messages only (DM)'}")
+        
         try:
             await bot.change_presence(status=discord.Status.dnd)
-            logger.info("🌙 Bot status set to 'Do Not Disturb' (DND)")
+            logger.info("🌙 Bot status presence successfully set to 'Do Not Disturb' (DND)!")
         except Exception as e:
             logger.warning(f"⚠️ Failed to set status to DND: {e}")
+
+        # Async background AI connection test on ready
+        asyncio.create_task(_check_ai_connection())
 
     @bot.command(name="start")
     async def cmd_start(ctx):
