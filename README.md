@@ -53,4 +53,9 @@ Rin — это проект персонального ИИ-компаньона
 **Лицензия**: [Apache License 2.0](LICENSE)
 **Автор**: Loki
 
+> [!IMPORTANT]
+> **Важная информация**: В проекте отсутствует встроенная готовая модель. Проект выступает как инструмент, но не как готовый сервис либо эмулятор готового продукта. Модель необходимо подключать отдельно (например, через LM Studio или любой другой OpenAI-совместимый API).
+>
+> **Important Note**: The project does not contain a built-in pre-trained model. The project acts strictly as a tool (framework), not as a ready service or product. The model must be connected separately (e.g., via LM Studio or any other OpenAI-compatible API).
+
 был многократно использован исскуственный интелект для кода
