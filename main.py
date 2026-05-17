@@ -246,23 +246,16 @@ async def _process_text(message, user_text: str, label: str = "") -> None:
                 persona_narrative=session["persona_narrative"]
             )
             
-            steered_instruction = (
-                f"Compile response as Rin.\n"
-                f"{persona_block}\n"
-                f"Respond naturally, matching the personality constraints."
-            )
-            
-            # Logit bias & tokenizer
-            logit_bias = build_generation_logit_bias(session["base_attitude"])
-            
             async with message.channel.typing():
-                # Direct speech generation
                 from speech_engine import SpeechGraph
                 speech_graph = SpeechGraph(client=client, model=MODEL)
-                response_text = await speech_graph.run_async(
-                    prompt=steered_instruction,
-                    logit_bias=logit_bias,
-                    max_tokens=150
+                response_text = await speech_graph.generate_async(
+                    signal=None,
+                    user_text=user_text,
+                    history=session["history"],
+                    persona_block=persona_block,
+                    tool_result="",
+                    warmth=session["warmth"]
                 )
                 
                 if not response_text or len(response_text) < 2:
@@ -334,35 +327,22 @@ async def _process_text(message, user_text: str, label: str = "") -> None:
                     tool_args.setdefault("user_id", session_id)
                 tool_result_str = await execute_tool(output.tool_name, tool_args)
 
-            # ── 7. Speech Orchestrator Logit Steering ─────────────
-            logit_bias = build_generation_logit_bias(session["base_attitude"])
-            max_tokens = min(output.tactic_id.get("max_length", 150), 300) if isinstance(output.tactic_id, dict) else 150
-
-            persona_block = _build_persona_block(
-                warmth=session["warmth"],
-                base_attitude=session["base_attitude"],
-                user_name=username,
-                core_memory=session["core_memory"],
-                persona_narrative=session["persona_narrative"]
+            # ── 7. Speech Engine ───────────────────────────
+            persona_block = (
+                f"Companion core state: {session['base_attitude']}. "
+                f"Companion warmth tier: {warmth_tier}. "
+                f"Companion narrative/memory: {session['persona_narrative'] or 'Empty'}. "
+                f"User name: {username}."
             )
 
-            steered_instruction = (
-                f"Compile response as Rin.\n"
-                f"{persona_block}\n"
-                f"<thinking>\nEmotion: {output.emotion_id}. Tactic: {output.tactic_id}.\n"
-                f"Hidden intent of companion: {output.hidden_intent}\n</thinking>\n"
-                f"Current message of companion: <user_message>{user_text}</user_message>"
-            )
-            if tool_result_str:
-                steered_instruction += f"\n{tool_result_str}"
-
-            # ── 8. Speech Graph Generation ────────────────────────
             from speech_engine import SpeechGraph
             speech_graph = SpeechGraph(client=client, model=MODEL)
-            response_text = await speech_graph.run_async(
-                prompt=steered_instruction,
-                logit_bias=logit_bias,
-                max_tokens=max_tokens
+            response_text = await speech_graph.generate_async(
+                signal=output,
+                user_text=user_text,
+                history=session["history"],
+                persona_block=persona_block,
+                tool_result=tool_result_str,
             )
 
             if not response_text or len(response_text) < 2:
