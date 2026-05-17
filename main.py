@@ -40,6 +40,8 @@ from database import (
     ensure_user, get_user, update_user_warmth, update_user_attitude, set_user_name,
     get_recent_think_logs, update_core_memory, update_persona_narrative,
 )
+from semantic_cache import get_semantic_cache_async, save_semantic_cache_async
+from semantic_router_engine import route_message_async
 
 # ── Логирование ──────────────────────────────────────────
 logging.basicConfig(level=logging.INFO,
@@ -254,6 +256,30 @@ async def _process_text(message: types.Message, user_text: str, label: str = "")
     persona = await get_user(session_id) # [V10.2] await
     chat_history = await get_session(chat_id) # [V10.2] await
 
+    # ── [Семантический кэш] ──────────────────────────────
+    cached_response = await get_semantic_cache_async(user_text)
+    if cached_response:
+        # Имитируем набор текста
+        await bot.send_chat_action(chat_id=chat_id, action="typing")
+        await _typing_delay(cached_response, chat_id)
+        
+        # Отвечаем
+        await message.answer(cached_response)
+        logger.info(f"⚡ [SEMANTIC CACHE] Ответ выдан из кэша: {cached_response}\n")
+        
+        # Обновляем историю и БД
+        display_text = f"[ЮЗЕР ПРИСЛАЛ ГОЛОСОВОЕ: \"{user_text}\"]" if label == "voice" else user_text
+        chat_history.append({"role": "user", "content": display_text})
+        await save_message(session_id, "user", display_text)
+        
+        chat_history.append({"role": "assistant", "content": cached_response})
+        await save_message(session_id, "assistant", cached_response)
+        
+        # Фоновое сохранение в векторную память
+        asyncio.create_task(save_to_memory_async("user", user_text, user_id=session_id))
+        asyncio.create_task(save_to_memory_async("assistant", cached_response, user_id=session_id))
+        return
+
     # Если голосовое — добавляем пометку
     display_text = f"[ЮЗЕР ПРИСЛАЛ ГОЛОСОВОЕ: \"{user_text}\"]" if label == "voice" else user_text
     chat_history.append({"role": "user", "content": display_text})
@@ -278,18 +304,34 @@ async def _process_text(message: types.Message, user_text: str, label: str = "")
     user_role = "создатель" if "создатель" in persona["core_memory"].lower() else "незнакомец"
 
     try:
-        # ── ЭТАП 1: THINK ENGINE → ThinkSignal ─────────
-        signal: ThinkSignal = await think_graph.run_async(
-            user_text=display_text,
-            chat_history=chat_history,
-            warmth=persona["warmth"],
-            memories_summary=memories_summary,
-            current_user_name=persona["name"],
-            user_role=user_role,
-            base_attitude=persona["base_attitude"],
-            time_passed_str=time_passed_str,
-            current_time_str=current_time_str,
-        )
+        # ── Семантическая маршрутизация ───────────────
+        route = await route_message_async(user_text)
+        
+        signal: ThinkSignal = None
+        if route == "general":
+            logger.info("🧭 [SEMANTIC ROUTER] Маршрут 'general' (пропуск System 2 мышления для оптимизации)")
+            signal = ThinkSignal(
+                should_speak=True,
+                needs_tool=False,
+                tool_name=None,
+                tool_args={},
+                rin_emotion="нейтральное",
+                rin_attitude="нейтральное",
+                debug_log="[🧭 SEMANTIC ROUTER] Маршрут 'general'. Пропуск System 2 мышления."
+            )
+        else:
+            # ── ЭТАП 1: THINK ENGINE → ThinkSignal ─────────
+            signal = await think_graph.run_async(
+                user_text=display_text,
+                chat_history=chat_history,
+                warmth=persona["warmth"],
+                memories_summary=memories_summary,
+                current_user_name=persona["name"],
+                user_role=user_role,
+                base_attitude=persona["base_attitude"],
+                time_passed_str=time_passed_str,
+                current_time_str=current_time_str,
+            )
         print(signal.debug_log)
 
         # [Задача 14] Логируем скрытый процесс мышления (V10.2: await)
@@ -366,6 +408,9 @@ async def _process_text(message: types.Message, user_text: str, label: str = "")
             save_to_memory_async("assistant", ai_response, user_id=session_id,
                                   extra_meta={"emotion": signal.emotion_id})
         )
+        
+        # Сохранение в семантический кэш
+        asyncio.create_task(save_semantic_cache_async(user_text, ai_response))
 
         # ── [V10] Авто-саммаризация (Триггер теперь внутри памяти) ────
         asyncio.create_task(_run_summarization(chat_id, session_id))
