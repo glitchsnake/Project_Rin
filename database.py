@@ -32,7 +32,7 @@ def init_db():
                 session_id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
                 warmth REAL DEFAULT 0.0,
-                base_attitude TEXT DEFAULT 'нейтральное',
+                base_attitude TEXT DEFAULT 'neutral',
                 core_memory TEXT DEFAULT '',
                 persona_narrative TEXT DEFAULT ''
             )

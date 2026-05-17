@@ -44,7 +44,7 @@ class TestDatabase(unittest.IsolatedAsyncioTestCase):
     async def test_01_ensure_and_get_user(self):
         """Verify that ensure_user creates a new record and get_user retrieves it."""
         session_id = "test_user_123"
-        user_name = "Алексей"
+        user_name = "Alex"
         
         # Create user
         await ensure_user(session_id, user_name)
@@ -54,7 +54,7 @@ class TestDatabase(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(profile)
         self.assertEqual(profile["name"], user_name)
         self.assertEqual(profile["warmth"], 0.0)
-        self.assertEqual(profile["base_attitude"], "нейтральное")
+        self.assertEqual(profile["base_attitude"], "neutral")
         self.assertEqual(profile["core_memory"], "")
         self.assertEqual(profile["persona_narrative"], "")
 
@@ -77,34 +77,34 @@ class TestDatabase(unittest.IsolatedAsyncioTestCase):
         session_id = "test_user_123"
         
         # Stance / attitude shift
-        await update_user_attitude(session_id, "тёплое и доверительное")
+        await update_user_attitude(session_id, "warm and trusting")
         # Core memory
-        await update_core_memory(session_id, "Знает программирование; Любит суши")
+        await update_core_memory(session_id, "Knows programming; Likes sushi")
         # Narrative
-        await update_persona_narrative(session_id, "Интересный собеседник, пишет регулярно")
+        await update_persona_narrative(session_id, "Interesting companion, writes regularly")
 
         profile = await get_user(session_id)
-        self.assertEqual(profile["base_attitude"], "тёплое и доверительное")
-        self.assertEqual(profile["core_memory"], "Знает программирование; Любит суши")
-        self.assertEqual(profile["persona_narrative"], "Интересный собеседник, пишет регулярно")
+        self.assertEqual(profile["base_attitude"], "warm and trusting")
+        self.assertEqual(profile["core_memory"], "Knows programming; Likes sushi")
+        self.assertEqual(profile["persona_narrative"], "Interesting companion, writes regularly")
 
     async def test_04_save_and_load_history(self):
         """Verify saving and loading message history lists."""
         session_id = "test_user_123"
         
         # Save messages
-        await save_message(session_id, "user", "Привет, Rin!")
-        await save_message(session_id, "assistant", "Привет.")
+        await save_message(session_id, "user", "Hello, Rin!")
+        await save_message(session_id, "assistant", "Hi.")
 
         # Load history
-        history = await load_history(session_id, system_prompt="ИНСТРУКЦИЯ", limit=10)
+        history = await load_history(session_id, system_prompt="INSTRUCTION", limit=10)
         self.assertEqual(len(history), 3, "Should contain system prompt + 2 messages")
         self.assertEqual(history[0]["role"], "system")
-        self.assertEqual(history[0]["content"], "ИНСТРУКЦИЯ")
+        self.assertEqual(history[0]["content"], "INSTRUCTION")
         self.assertEqual(history[1]["role"], "user")
-        self.assertEqual(history[1]["content"], "Привет, Rin!")
+        self.assertEqual(history[1]["content"], "Hello, Rin!")
         self.assertEqual(history[2]["role"], "assistant")
-        self.assertEqual(history[2]["content"], "Привет.")
+        self.assertEqual(history[2]["content"], "Hi.")
 
     async def test_05_touch_and_get_message_time(self):
         """Verify touching last message timestamp works correctly."""

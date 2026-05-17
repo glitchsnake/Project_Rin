@@ -11,35 +11,35 @@ import speech_engine
 class TestSpeechEngine(unittest.TestCase):
     def test_clean_output_basic(self):
         """Verify that _clean_output strips basic whitespaces and returns standard text."""
-        self.assertEqual(_clean_output(" Привет. "), "Привет.")
+        self.assertEqual(_clean_output(" Hello. "), "Hello.")
         self.assertEqual(_clean_output(""), ".")
 
     def test_clean_output_thinking_tags(self):
         """Verify that <thinking> tags and their contents are successfully stripped."""
-        raw_text = "<thinking>Надо ответить сухо.</thinking>Привет."
-        self.assertEqual(_clean_output(raw_text), "Привет.")
+        raw_text = "<thinking>Must answer dryly.</thinking>Hello."
+        self.assertEqual(_clean_output(raw_text), "Hello.")
 
-        nested_text = "<thinking>ФАКТ: Вопрос\nАНАЛИЗ: Простой\nРЕАКЦИЯ: Холод</thinking><response>Нормально.</response>"
-        self.assertEqual(_clean_output(nested_text), "Нормально.")
+        nested_text = "<thinking>FACT: Question\nANALYSIS: Simple\nREACTION: Cold</thinking><response>Fine.</response>"
+        self.assertEqual(_clean_output(nested_text), "Fine.")
 
     def test_clean_output_response_tags(self):
         """Verify that <response> tags are parsed and only inner text is retrieved."""
-        self.assertEqual(_clean_output("<response>Конечно.</response>"), "Конечно.")
-        self.assertEqual(_clean_output("   <response>  Ладно.   </response> "), "Ладно.")
+        self.assertEqual(_clean_output("<response>Sure.</response>"), "Sure.")
+        self.assertEqual(_clean_output("   <response>  Okay.   </response> "), "Okay.")
 
     def test_clean_output_leakage_markers(self):
         """Verify that prompt leakage markers trigger fallback to the first sentence or dot."""
-        # Contains "[справка: " marker, should extract first sentence
-        leaked_text = "Конечно. [справка: Википедия]"
-        self.assertEqual(_clean_output(leaked_text), "Конечно")
+        # Contains "[ref: " marker, should extract first sentence
+        leaked_text = "Sure. [ref: Wikipedia]"
+        self.assertEqual(_clean_output(leaked_text), "Sure")
 
-        # Contains "моя тактика" marker, should extract first sentence
-        leaked_text_2 = "Я тут. Моя тактика - промолчать."
-        self.assertEqual(_clean_output(leaked_text_2), "Я тут")
+        # Contains "my tactic" marker, should extract first sentence
+        leaked_text_2 = "I'm here. My tactic - keep silent."
+        self.assertEqual(_clean_output(leaked_text_2), "I'm here")
 
         # Single word leaked with marker should fall back to "."
-        leaked_text_3 = "[справка: ]"
-        self.assertEqual(_clean_output(leaked_text_3), "[справка: ]")
+        leaked_text_3 = "[ref: ]"
+        self.assertEqual(_clean_output(leaked_text_3), "[ref: ]")
 
     def test_build_generation_logit_bias(self):
         """Verify logit bias retrieval based on warmth level and initialization status."""

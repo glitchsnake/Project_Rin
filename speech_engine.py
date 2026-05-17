@@ -15,12 +15,12 @@ COOLDOWN_LIMIT = 50   # Steering vocabulary token limit per tactic
 
 # Steered word arrays (influence relationship warmth and tone)
 STEERING_WORDS_COLD = [
-    "отвали", "ладно", "ясно", "...", "мда", "зачем", "хватит", "нет",
-    "неинтересно", "уйди", "глупо", "никак", "нормально", "серо"
+    "away", "okay", "whatever", "...", "sigh", "why", "stop", "no",
+    "uninteresting", "leave", "silly", "nothing", "fine", "gray"
 ]
 STEERING_WORDS_WARM = [
-    "привет", "спасибо", "тихо", "наверное", "тоже", "слушаю", "почему",
-    "расскажи", "как", "немного", "улыбаюсь", "вместе", "хочешь"
+    "hello", "thanks", "quiet", "probably", "too", "listening", "why",
+    "tell", "how", "little", "smiling", "together", "want"
 ]
 
 # Engine global initialization states
@@ -32,16 +32,16 @@ _PRECOMPUTED_WARM_BIAS: Dict[str, float] = {}
 # Prompt leakage markers (detected interior meta-motives to block)
 _LEAKAGE_MARKERS = [
     "<thinking", "</thinking", "<response", "</response",
-    "[справка:", "[observation:", "[архивное", "моя тактика", "выбранная тактика"
+    "[ref:", "[observation:", "[archive", "my tactic", "selected tactic"
 ]
 
 # Tactic length constraints (tokens)
 TACTIC_LENGTH = {
-    "короткая реакция":  15,
-    "сухой ответ":       25,
-    "мягкое слушание":   55,
-    "игнорирование":     1,
-    "тактика ответа":    40
+    "short reaction":  15,
+    "dry response":       25,
+    "soft listening":   55,
+    "ignoring":     1,
+    "response tactic":    40
 }
 
 # ════════════════════════════════════════════════════════

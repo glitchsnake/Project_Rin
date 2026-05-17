@@ -20,26 +20,26 @@ class TestMemory(unittest.TestCase):
     def test_count_history_tokens(self):
         """Verify summation of tokens in a simulated message history list."""
         history = [
-            {"role": "user", "content": "Привет, как дела?"},
-            {"role": "assistant", "content": "Нормально."}
+            {"role": "user", "content": "Hi, how are you?"},
+            {"role": "assistant", "content": "Fine."}
         ]
         total = count_history_tokens(history)
         self.assertGreater(total, 0)
         # Verify it accounts for overhead per message
-        self.assertGreater(total, count_tokens("Привет, как дела?") + count_tokens("Нормально."))
+        self.assertGreater(total, count_tokens("Hi, how are you?") + count_tokens("Fine."))
 
     def test_is_important(self):
         """Verify importance filter logic based on role and text length."""
         # System messages are never important
-        self.assertFalse(_is_important("system", "Это очень важная системная инструкция."))
+        self.assertFalse(_is_important("system", "This is an important system instruction."))
 
         # Short messages are not important
-        self.assertFalse(_is_important("user", "Привет"))
-        self.assertFalse(_is_important("assistant", "Ок"))
+        self.assertFalse(_is_important("user", "Hi"))
+        self.assertFalse(_is_important("assistant", "Ok"))
 
         # Long messages are important
-        self.assertTrue(_is_important("user", "Расскажи мне подробную историю о том, как устроен этот бот."))
-        self.assertTrue(_is_important("assistant", "Я сижу дома и слушаю музыку, потому что на улице идет дождь."))
+        self.assertTrue(_is_important("user", "Tell me a detailed story about how this bot is designed."))
+        self.assertTrue(_is_important("assistant", "I am sitting at home listening to music because it is raining outside."))
 
     @patch('memory._init_memory')
     def test_is_memory_available(self, mock_init):
@@ -71,7 +71,7 @@ class TestMemory(unittest.TestCase):
         }
 
         # Save duplicate message
-        memory.save_to_memory(role="user", content="Какая-то важная повторяющаяся фраза.", user_id="test_user")
+        memory.save_to_memory(role="user", content="Some important repeating phrase.", user_id="test_user")
 
         # Check that duplicate branch was hit: collection.update called, not add
         mock_collection.update.assert_called_once()

@@ -148,9 +148,9 @@ async def _safe_run_summarization(history: list[dict], user_id: str):
                 # Signal to the agent to dynamically update its Core Memory profile
                 if summary_output.core_memory_update:
                     observation_msg = (
-                        f"[АРХИВНОЕ НАБЛЮДЕНИЕ]: Анализ диалогов показал новые факты. "
-                        f"Предложение по обновлению Core Memory: '{summary_output.core_memory_update}'. "
-                        f"Ты можешь вызвать инструмент update_core_memory для сохранения, если это важно."
+                        f"[ARCHIVE OBSERVATION]: Dialogue analysis revealed new facts. "
+                        f"Suggested Core Memory update: '{summary_output.core_memory_update}'. "
+                        f"You can call update_core_memory tool to save this if it is important."
                     )
                     active_sessions[user_id]["history"].append({"role": "system", "content": observation_msg})
                     logger.info(f"💡 [MEMORY] Suggestion injected for user {user_id}: {summary_output.core_memory_update}")
@@ -192,7 +192,7 @@ async def _transcribe_voice(file_path: str) -> Optional[str]:
 @dp.message(F.content_type.in_({"text", "voice"}))
 async def handle_any_message(message: Message):
     user_id   = str(message.from_user.id)
-    user_name = message.from_user.first_name or "Друг"
+    user_name = message.from_user.first_name or "Friend"
     
     # Initialize lock for this user to prevent race conditions in fast double clicks
     if user_id not in session_locks:
@@ -248,12 +248,12 @@ async def handle_any_message(message: Message):
                 
                 user_text = await _transcribe_voice(voice_temp_path)
                 if not user_text:
-                    await message.reply("Я не смогла разобрать голос...")
+                    await message.reply("I couldn't understand the voice...")
                     return
                 logger.info(f"🎙️ [STT] Result: \"{user_text}\"")
             except Exception as e:
                 logger.error(f"❌ [VOICE] Failed to process voice: {e}")
-                await message.reply("У меня не получилось прослушать твою запись.")
+                await message.reply("I was unable to listen to your voice recording.")
                 return
             finally:
                 if voice_temp_path and os.path.exists(voice_temp_path):
@@ -321,7 +321,7 @@ async def handle_any_message(message: Message):
 
         # Check for Silence Tactic
         if not output.should_speak:
-            logger.info("🗣️ [SPEECH] Tactic 'игнорирование' activated. Rin is silent.")
+            logger.info("🗣️ [SPEECH] Tactic 'ignoring' activated. Rin is silent.")
             return
 
         # ── 6. Tool / Function Dispatching ───────────────────
@@ -334,7 +334,7 @@ async def handle_any_message(message: Message):
                 args["user_id"] = user_id
                 
             tool_res = await execute_tool(output.tool_name, args)
-            tool_result_str = f"\n[Фактическая справка от системы по вызову {output.tool_name}]: {tool_res}"
+            tool_result_str = f"\n[Factual system context from tool {output.tool_name}]: {tool_res}"
             logger.info(f"🔧 [TOOL CALL] Done. Result: {tool_res[:80]}...")
 
         # ── 7. Generate Speech Generation Prompt ──────────────
@@ -353,9 +353,9 @@ async def handle_any_message(message: Message):
         # Inject thinking context and tool results to steer final output speech
         steered_instruction = (
             f"{speech_prompt}\n"
-            f"<thinking>\nЭмоция: {output.emotion_id}. Тактика: {output.tactic_id}.\n"
-            f"Внутренний мотив собеседника: {output.hidden_intent}\n</thinking>\n"
-            f"Текущая реплика собеседника: \"{user_text}\""
+            f"<thinking>\nEmotion: {output.emotion_id}. Tactic: {output.tactic_id}.\n"
+            f"Hidden intent of companion: {output.hidden_intent}\n</thinking>\n"
+            f"Current message of companion: \"{user_text}\""
         )
         if tool_result_str:
             steered_instruction += f"\n{tool_result_str}"
@@ -380,9 +380,9 @@ async def handle_any_message(message: Message):
         # ── 9. Warmth & Relationship Adjustments ─────────────
         # Cold responses slowly decrease warmth, neutral keeps same, warm acts differently
         warmth_delta = 0.0
-        if output.emotion_id in ["усталая нежность", "тихое тепло"]:
+        if output.emotion_id in ["tired tenderness", "quiet warmth"]:
              warmth_delta = 0.05
-        elif output.emotion_id in ["сухой сарказм", "раздражение", "тихое презрение"]:
+        elif output.emotion_id in ["dry sarcasm", "irritation", "quiet contempt"]:
              warmth_delta = -0.05
              
         if warmth_delta != 0.0:

@@ -1,5 +1,5 @@
 """
-think_engine.py — Rin Cognitive Thinking Module (V10: Structured Outputs + Pydantic + Native Tools)
+think_engine.py — Rin Cognitive Thinking Module (V10.3: Structured Outputs + Pydantic + Native Tools)
 
 Architectural Inspiration:
   • OpenAI Structured Outputs → Native JSON parsing via Pydantic.
@@ -54,7 +54,7 @@ class ThinkState:
         self.rin_inner_conflict: str = ""
         self.rin_emotion: str = "boredom"
         self.rin_attitude: str = "neutral"
-        self.response_tactic: str = "short response"
+        self.response_tactic: str = "short reaction"
         
         # Flags
         self.should_ignore: bool = False
@@ -65,29 +65,28 @@ class ThinkState:
         self.error: Optional[str] = None
 
 # ════════════════════════════════════════════════════════
-#  Valid Parameter Lists (Enums aligned with fine-tune dataset)
+#  Valid Parameter Lists (Enums aligned with English fine-tune dataset)
 # ════════════════════════════════════════════════════════
 
 VALID_EMOTIONS = {
-    "задумчивость", "скука", "растерянность", "сухой сарказм",
-    "тихое презрение", "раздражение", "равнодушие", "отстраненность",
-    "усталая нежность", "грусть", "щемящая пустота", "тихое тепло"
+    "pensiveness", "boredom", "confusion", "dry sarcasm",
+    "quiet contempt", "irritation", "indifference", "detachment",
+    "tired tenderness", "sadness", "aching emptiness", "quiet warmth"
 }
 
 VALID_ATTITUDES = {
-    "отстраненное", "настороженное", "нейтральное", "заинтересованное",
-    "тёплое и доверительное"
+    "detached", "guarded", "neutral", "interested", "warm and trusting"
 }
 
 VALID_TACTICS = {
-    "короткая реакция", "сухой ответ", "мягкое слушание", "игнорирование"
+    "short reaction", "dry response", "soft listening", "ignoring"
 }
 
 TACTIC_LENGTH = {
-    "короткая реакция": 15,
-    "сухой ответ": 25,
-    "мягкое слушание": 55,
-    "игнорирование": 1
+    "short reaction": 15,
+    "dry response": 25,
+    "soft listening": 55,
+    "ignoring": 1
 }
 
 # ════════════════════════════════════════════════════════
@@ -194,54 +193,54 @@ class LLMThinkOutput(BaseModel):
     @field_validator('rin_emotion')
     def validate_emotion(cls, v):
         if v not in VALID_EMOTIONS:
-            logger.warning(f"⚠️ [THINK] Unknown emotion '{v}' fallback to 'отстраненность'")
-            return "отстраненность"
+            logger.warning(f"⚠️ [THINK] Unknown emotion '{v}' fallback to 'detachment'")
+            return "detachment"
         return v
 
     @field_validator('rin_attitude')
     def validate_attitude(cls, v):
         if v not in VALID_ATTITUDES:
-            logger.warning(f"⚠️ [THINK] Unknown attitude '{v}' fallback to 'нейтральное'")
-            return "нейтральное"
+            logger.warning(f"⚠️ [THINK] Unknown attitude '{v}' fallback to 'neutral'")
+            return "neutral"
         return v
 
     @field_validator('response_tactic')
     def validate_tactic(cls, v):
         if v not in VALID_TACTICS:
-            logger.warning(f"⚠️ [THINK] Unknown tactic '{v}' fallback to 'короткая реакция'")
-            return "короткая реакция"
+            logger.warning(f"⚠️ [THINK] Unknown tactic '{v}' fallback to 'short reaction'")
+            return "short reaction"
         return v
 
 # ════════════════════════════════════════════════════════
 #  Utilities
 # ════════════════════════════════════════════════════════
 
-_VULNERABILITY_SIGNALS = ["грустно", "плохо", "устал", "одиноко", "больно", "😢", "😭", "😔", "😞", ":(", "тяжело", "не могу"]
+_VULNERABILITY_SIGNALS = ["sad", "bad", "tired", "lonely", "hurt", "😢", "😭", "😔", "😞", ":(", "hard", "can't"]
 
 def _build_persona_block(warmth: float, base_attitude: str, user_name: str,
                          core_memory: str, persona_narrative: str) -> str:
     """Assembles the dynamic persona context block for speech generation."""
     base = (
-        f"Твое имя Rin. Тебе 20 лет. Внутри всегда ощущается легкая пустота и серость. "
-        f"Ты не любишь тратить слова впустую. Редко пишешь больше одного предложения.\n"
-        f"Текущий собеседник: {user_name}. Базовое отношение: {base_attitude}.\n"
+        f"Your name is Rin. You are 20 years old. There is always a slight emptiness and grayness inside. "
+        f"You don't like wasting words. You rarely write more than one sentence.\n"
+        f"Current companion: {user_name}. Base attitude: {base_attitude}.\n"
     )
     if core_memory:
-         base += f"[Факты из долгосрочной памяти]: {core_memory}\n"
+         base += f"[Facts from long-term memory]: {core_memory}\n"
     if persona_narrative:
-         base += f"[История отношений]: {persona_narrative}\n"
+         base += f"[Relationship history]: {persona_narrative}\n"
          
     # Warmth gradients steering tone narrative
     if warmth < 0:
-        style = "ДИНАМИКА: Собеседник неприятен. Сухо, отстраненно. Не пиши лишних букв."
+        style = "DYNAMIC: The companion is unpleasant. Dry, detached. Do not write extra characters."
     elif warmth <= 0.5:
-        style = "ДИНАМИКА: Знакомый. Дистанция, краткость. Редко пишешь больше одного предложения."
+        style = "DYNAMIC: Acquaintance. Distance, brevity. You rarely write more than one sentence."
     else:
-        style = "ДИНАМИКА: Близкий человек. Можно быть чуть теплее. Одно-два предложения с искренним теплом."
+        style = "DYNAMIC: Close person. You can be slightly warmer. One or two sentences with genuine warmth."
         
     anti_bleed = (
-        "ВАЖНО: Запрещено выдавать свои мысли или мета-параметры. Пиши только саму фразу.\n"
-        "Отвечай строго на языке собеседника (русском)."
+        "IMPORTANT: You are strictly forbidden to reveal your thinking thoughts, emotions, tactics, or meta-parameters. Write only the phrase itself.\n"
+        "Reply strictly in English."
     )
     return base + style + "\n\n" + anti_bleed
 
@@ -250,9 +249,9 @@ def _check_vulnerability(user_text: str, warmth: float, rin_emotion: str) -> str
     if warmth <= 0: return rin_emotion
     text_lower = user_text.lower()
     if any(sig in text_lower for sig in _VULNERABILITY_SIGNALS):
-        if rin_emotion in ["сухой сарказм", "тихое презрение", "раздражённая скука", "раздражение"]:
-            logger.info(f"🧬 [THINK] Emotion Gradient Override: {rin_emotion} → равнодушие")
-            return "равнодушие"
+        if rin_emotion in ["dry sarcasm", "quiet contempt", "irritation"]:
+            logger.info(f"🧬 [THINK] Emotion Gradient Override: {rin_emotion} → indifference")
+            return "indifference"
     return rin_emotion
 
 # ════════════════════════════════════════════════════════
@@ -261,7 +260,7 @@ def _check_vulnerability(user_text: str, warmth: float, rin_emotion: str) -> str
 
 def _node_router(state: ThinkState) -> str:
     """Graph routing node: branches System 1 (fast matching) or System 2 (deep analysis)."""
-    fast_triggers = ["привет", "как дела", "ясно", "понятно", "ок", "угу", "мм", "спокойной ночи", "доброе утро"]
+    fast_triggers = ["hello", "hi", "how are you", "fine", "ok", "yep", "um", "good night", "good morning"]
     clean_text = state.user_text.strip().lower().rstrip("!?.,")
     
     if len(clean_text) < 25 and clean_text in fast_triggers:
@@ -275,8 +274,8 @@ def _node_system_1_fast_track(state: ThinkState) -> ThinkState:
     state.hidden_intent = "Maintaining contact."
     state.rin_inner_conflict = "FACT: Small talk. ANALYSIS: Deep cognition not required. REACTION: Standard dry tone."
     state.confidence = 1.0
-    state.rin_emotion = "скука"
-    state.response_tactic = "короткая реакция"
+    state.rin_emotion = "boredom"
+    state.response_tactic = "short reaction"
     return state
 
 
@@ -348,8 +347,8 @@ def _node_system_2_deep_thought(state: ThinkState, client: OpenAI, model: str) -
         state.error = str(e)
         state.rin_inner_conflict = f"Error in cognitive cycle: {e}"
         # safe fallback
-        state.rin_emotion = "отстраненность"
-        state.response_tactic = "короткая реакция"
+        state.rin_emotion = "detachment"
+        state.response_tactic = "short reaction"
         
     return state
 
@@ -385,7 +384,7 @@ class ThinkGraph:
         state.rin_emotion = _check_vulnerability(user_text, warmth, state.rin_emotion)
         
         # Ignores triggers
-        if state.response_tactic == "игнорирование":
+        if state.response_tactic == "ignoring":
             state.should_ignore = True
             
         max_len = TACTIC_LENGTH.get(state.response_tactic, 40)
