@@ -172,7 +172,7 @@ try:
     import discord
     from discord.ext import commands
     DISCORD_AVAILABLE = True
-except ImportError:
+except (ImportError, ModuleNotFoundError):
     DISCORD_AVAILABLE = False
     # Заглушки классов для обеспечения работы юнит-тестов без установленного discord.py
     class Dummy:
