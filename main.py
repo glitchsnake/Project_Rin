@@ -300,7 +300,16 @@ async def handle_any_message(message: Message):
              return
 
         # ── [Semantic Cache Check] ──────────────────────────
-        cached_response = await get_semantic_cache_async(user_text)
+        warmth = session["warmth"]
+        attitude = session["base_attitude"]
+        if warmth < 0:
+            warmth_tier = "cold"
+        elif warmth <= 0.5:
+            warmth_tier = "neutral"
+        else:
+            warmth_tier = "warm"
+
+        cached_response = await get_semantic_cache_async(user_text, attitude, warmth_tier)
         if cached_response:
             await bot.send_chat_action(chat_id=message.chat.id, action="typing")
             
@@ -450,7 +459,15 @@ async def handle_any_message(message: Message):
         asyncio.create_task(_safe_save_to_memory("assistant", response_text, user_id))
 
         # Save to semantic cache
-        asyncio.create_task(save_semantic_cache_async(user_text, response_text))
+        final_warmth = session["warmth"]
+        final_attitude = session["base_attitude"]
+        if final_warmth < 0:
+            final_warmth_tier = "cold"
+        elif final_warmth <= 0.5:
+            final_warmth_tier = "neutral"
+        else:
+            final_warmth_tier = "warm"
+        asyncio.create_task(save_semantic_cache_async(user_text, response_text, final_attitude, final_warmth_tier))
 
         # Send response back to Telegram
         await message.reply(response_text)

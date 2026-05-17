@@ -28,8 +28,8 @@ def _init_cache_collection():
         return None
 
 
-def get_semantic_cache(user_text: str) -> Optional[str]:
-    """Looks up a semantically similar response in cache."""
+def get_semantic_cache(user_text: str, attitude: str, warmth_tier: str) -> Optional[str]:
+    """Looks up a semantically similar response in cache with attitude and warmth_tier filtering."""
     # Do not cache slash commands
     if user_text.strip().startswith("/"):
         return None
@@ -47,7 +47,8 @@ def get_semantic_cache(user_text: str) -> Optional[str]:
         results = collection.query(
             query_embeddings=[embedding],
             n_results=1,
-            include=["documents", "metadatas", "distances"]
+            include=["documents", "metadatas", "distances"],
+            where={"$and": [{"attitude": attitude}, {"warmth_tier": warmth_tier}]}
         )
         
         if not results["documents"] or not results["documents"][0]:
@@ -67,13 +68,13 @@ def get_semantic_cache(user_text: str) -> Optional[str]:
     return None
 
 
-async def get_semantic_cache_async(user_text: str) -> Optional[str]:
+async def get_semantic_cache_async(user_text: str, attitude: str, warmth_tier: str) -> Optional[str]:
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, get_semantic_cache, user_text)
+    return await loop.run_in_executor(None, get_semantic_cache, user_text, attitude, warmth_tier)
 
 
-def save_semantic_cache(user_text: str, ai_response: str) -> None:
-    """Saves prompt-response pair to semantic cache."""
+def save_semantic_cache(user_text: str, ai_response: str, attitude: str, warmth_tier: str) -> None:
+    """Saves prompt-response pair to semantic cache with attitude and warmth_tier metadata."""
     if user_text.strip().startswith("/") or not ai_response:
         return
         
@@ -90,13 +91,18 @@ def save_semantic_cache(user_text: str, ai_response: str) -> None:
             ids=[doc_id],
             embeddings=[embedding],
             documents=[user_text],
-            metadatas=[{"ai_response": ai_response, "timestamp": datetime.now().isoformat()}]
+            metadatas=[{
+                "ai_response": ai_response,
+                "timestamp": datetime.now().isoformat(),
+                "attitude": attitude,
+                "warmth_tier": warmth_tier
+            }]
         )
         logger.info("💾 [SEMANTIC CACHE] Response saved to cache.")
     except Exception as e:
         logger.warning(f"⚠️  [SEMANTIC CACHE] Error saving to cache: {e}")
 
 
-async def save_semantic_cache_async(user_text: str, ai_response: str) -> None:
+async def save_semantic_cache_async(user_text: str, ai_response: str, attitude: str, warmth_tier: str) -> None:
     loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, save_semantic_cache, user_text, ai_response)
+    await loop.run_in_executor(None, save_semantic_cache, user_text, ai_response, attitude, warmth_tier)
