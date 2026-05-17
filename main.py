@@ -481,6 +481,11 @@ if DISCORD_AVAILABLE:
     @bot.event
     async def on_ready():
         logger.info(f"🌸 Bot {bot.user.name} successfully connected to Discord!")
+        try:
+            await bot.change_presence(status=discord.Status.dnd)
+            logger.info("🌙 Bot status set to 'Do Not Disturb' (DND)")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to set status to DND: {e}")
 
     @bot.command(name="start")
     async def cmd_start(ctx):
