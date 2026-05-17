@@ -529,6 +529,9 @@ if DISCORD_AVAILABLE:
     # ── Главный обработчик входящих событий ───────────────
     @bot.event
     async def on_message(message: discord.Message):
+        # Логируем для отладки
+        logger.info(f"📨 [MESSAGE] Получено сообщение от {message.author}: content='{message.content}', attachments={len(message.attachments)}")
+
         # Пропускаем сообщения самого бота
         if message.author == bot.user:
             return
