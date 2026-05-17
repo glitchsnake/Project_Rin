@@ -533,6 +533,9 @@ if DISCORD_AVAILABLE:
 
     @bot.event
     async def on_message(message: discord.Message):
+        # Log for debugging
+        logger.info(f"📨 [MESSAGE] Received message from {message.author}: content='{message.content}', attachments={len(message.attachments)}")
+
         if message.author == bot.user:
             return
 
